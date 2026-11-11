@@ -1,0 +1,70 @@
+# cargo-deny 設定ファイル
+# 例外追加時は必ず以下のコメント形式を使うこと:
+# EXCEPTION: <理由> <Issue番号> <期限 YYYY-MM-DD>
+#
+
+[graph]
+targets = [
+  { triple = "x86_64-unknown-linux-gnu" },
+  { triple = "x86_64-pc-windows-msvc" },
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+  # EXCEPTION: zbus 5 maintenance notices, not reachable on supported targets.
+  # GUI notification plugin is Windows-only; notify-rust enables zbus only on Unix.
+  # Tracking: https://github.com/sahokun/git-clawler/issues/5; expires 2027-01-10.
+  # Reevaluate before enabling Linux GUI or adding any other zbus dependency path.
+  "RUSTSEC-2026-0370", # zvariant merged into zbus 6
+  "RUSTSEC-2026-0371", # zbus_names merged into zbus 6
+  "RUSTSEC-2026-0372", # zvariant_derive merged into zbus 6
+  # EXCEPTION: Tauri maintenance warnings on Windows; no safe upstream upgrade.
+  # Target: Windows GUI build/runtime. Tracking: https://github.com/sahokun/git-clawler/issues/5
+  # Review expires 2027-01-10. Remove each entry when Tauri replaces the dependency.
+  "RUSTSEC-2025-0098", # unic-ucd-version (unmaintained)
+  "RUSTSEC-2025-0100", # unic-ucd-ident (unmaintained)
+  "RUSTSEC-2025-0081", # unic-char-property (unmaintained)
+  "RUSTSEC-2025-0080", # unic-common (unmaintained)
+  "RUSTSEC-2025-0075", # unic-char-range (unmaintained)
+  "RUSTSEC-2025-0057", # fxhash (unmaintained)
+  "RUSTSEC-2024-0370", # proc-macro-error (build-only, unmaintained)
+  # EXCEPTION: glib is only in unsupported Linux GUI dependencies in Cargo.lock.
+  # Neither the Linux CLI/helper nor Windows GUI links this code. Same review/issue.
+  "RUSTSEC-2024-0429",
+  # EXCEPTION: rand 0.7 is build-only through selectors/phf_generator on Windows.
+  # Uses SmallRng without log; the thread_rng + reentrant logger condition is absent.
+  # Same review deadline and tracking issue. Regression review includes cargo tree -e features.
+  "RUSTSEC-2026-0097",
+]
+
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-DFS-2016",
+  "Unicode-3.0",
+  "Zlib",
+  "MPL-2.0",
+  "CC0-1.0",
+  "OpenSSL",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []

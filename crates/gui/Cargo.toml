@@ -1,0 +1,50 @@
+[package]
+name         = "git-clawler-gui"
+description  = "Tauri GUI for git-clawler (Windows)"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+authors      = { workspace = true }
+publish      = false
+
+[[bin]]
+name = "git-clawler-gui"
+path = "src/main.rs"
+
+[lib]
+name = "git_clawler_gui"
+path = "src/lib.rs"
+
+[dependencies]
+# core logic
+git-clawler-core = { workspace = true }
+# WSL helper protocol types (used by GUI WslExecutor)
+git-clawler-wsl-helper = { path = "../wsl-helper" }
+# DTO serialization (all platforms — inner fn must compile on Linux)
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+chrono      = { workspace = true }
+tokio       = { workspace = true }
+futures     = { workspace = true }
+tracing     = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+async-trait = "0.1.92"
+
+[dev-dependencies]
+git2        = { workspace = true }
+tempfile    = { workspace = true }
+tokio       = { workspace = true, features = ["test-util"] }
+
+# Windows-only: Tauri runtime
+[target.'cfg(target_os = "windows")'.dependencies]
+tauri = { workspace = true, features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-notification = "2.3.3"
+
+# Windows-only: Tauri build helper (generates context at compile time)
+[target.'cfg(target_os = "windows")'.build-dependencies]
+tauri-build = { workspace = true }

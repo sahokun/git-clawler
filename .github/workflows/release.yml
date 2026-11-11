@@ -1,0 +1,245 @@
+# Release workflow: builds helper binary (Linux musl), Windows MSI + portable zip, Linux CLI,
+# and publishes a draft GitHub Release for version tags.
+#
+# Job order:
+#   1. helper-musl   (ubuntu-latest)  — cross-compile wsl-helper to x86_64-unknown-linux-musl
+#   2. windows-bundle (windows-latest) — download helper, build MSI and portable zip via cargo tauri build
+#   3. linux-cli      (ubuntu-latest)  — build CLI binary (runs in parallel with windows-bundle)
+#   4. release-publish (ubuntu-latest) — create draft GitHub Release on v* tags
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate versions and tag
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            python3 scripts/check-release-version.py "$GITHUB_REF_NAME"
+          else
+            python3 scripts/check-release-version.py
+          fi
+  quality:
+    needs: versions
+    uses: ./.github/workflows/ci.yml
+  security:
+    uses: ./.github/workflows/dependency-security.yml
+  # ------------------------------------------------------------------ #
+  # Job 1: build wsl-helper as x86_64-unknown-linux-musl static binary  #
+  # ------------------------------------------------------------------ #
+  helper-musl:
+    name: Build WSL helper (musl)
+    runs-on: ubuntu-latest
+    needs: [quality, security]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+        with:
+          toolchain: 1.93.1
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install ziglang (pinned)
+        run: pip install ziglang==0.13.0
+
+      - name: Install cargo-zigbuild (pinned)
+        run: cargo install cargo-zigbuild --version 0.20.1 --locked
+
+      - name: Build wsl-helper (musl static)
+        run: cargo zigbuild -p git-clawler-wsl-helper -p git-clawler --locked --release --target x86_64-unknown-linux-musl
+
+      - name: Verify static ELF binary
+        run: |
+          for binary in git-clawler-wsl-helper gclawl; do
+            file "target/x86_64-unknown-linux-musl/release/$binary" | grep -E "ELF.*(statically linked|static-pie linked)"
+          done
+
+      - name: Upload helper artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: wsl-helper-musl
+          path: |
+            target/x86_64-unknown-linux-musl/release/git-clawler-wsl-helper
+            target/x86_64-unknown-linux-musl/release/gclawl
+          if-no-files-found: error
+          retention-days: 1
+
+  # ------------------------------------------------------------------ #
+  # Job 2: build Windows MSI and portable zip (bundles the helper binary) #
+  # ------------------------------------------------------------------ #
+  windows-bundle:
+    name: Build Windows GUI bundle
+    runs-on: windows-latest
+    needs: helper-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+        with:
+          toolchain: 1.93.1
+          components: rustfmt, clippy
+
+      - name: Download wsl-helper artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: wsl-helper-musl
+          path: crates/gui/resources/wsl-helper/x86_64-unknown-linux-musl/
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: crates/gui/.nvmrc
+      - name: Record Node runtime
+        run: |
+          node --version
+          node -p "process.execPath"
+          npm --version
+
+      - name: Install frontend dependencies
+        # Frontend build itself is delegated to tauri's `beforeBuildCommand`
+        # (`npm run build`, see crates/gui/tauri.conf.json). We still need
+        # node_modules in place for that hook, so `npm ci` stays here.
+        working-directory: crates/gui
+        run: npm ci
+
+      - name: Build Tauri MSI
+        working-directory: crates/gui
+        run: npm run tauri -- build --bundles msi -- --locked
+
+      - name: Create portable zip
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-portable.ps1
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: git-clawler-msi
+          path: target/release/bundle/msi/*.msi
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload portable zip artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: git-clawler-windows-portable
+          path: target/release/git-clawler-windows-x86_64-portable.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  # ------------------------------------------------------------------ #
+  # Job 3: build Linux CLI binary (parallel with windows-bundle)        #
+  # ------------------------------------------------------------------ #
+  linux-cli:
+    name: Package Linux CLI
+    runs-on: ubuntu-latest
+    needs: helper-musl
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: wsl-helper-musl
+          path: dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gclawl-cli-linux
+          path: dist/gclawl
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ #
+  # Job 4: publish draft GitHub Release for version tags                #
+  # ------------------------------------------------------------------ #
+  release-publish:
+    name: Publish draft release
+    runs-on: ubuntu-latest
+    needs: [windows-bundle, linux-cli, helper-musl]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate release versions
+        run: python3 scripts/check-release-version.py "$GITHUB_REF_NAME"
+
+      - name: Verify native security release constraints
+        run: python3 scripts/test-release-security.py
+
+      - name: Download Windows MSI
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: git-clawler-msi
+          path: dist/git-clawler-msi
+
+      - name: Download Linux CLI
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: gclawl-cli-linux
+          path: dist/gclawl-cli-linux
+
+      - name: Download WSL helper
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: wsl-helper-musl
+          path: dist/wsl-helper-musl
+
+      - name: Download Windows portable zip
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: git-clawler-windows-portable
+          path: dist/git-clawler-windows-portable
+
+      - name: Rename release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          msi_files=(dist/git-clawler-msi/*.msi)
+          if [ "${#msi_files[@]}" -ne 1 ]; then
+            echo "Expected exactly one MSI" >&2
+            exit 1
+          fi
+          if [ "${#msi_files[@]}" -eq 1 ]; then
+            mv "${msi_files[0]}" "dist/git-clawler-${GITHUB_REF_NAME}-windows-x86_64.msi"
+          fi
+          portable_dir="dist/git-clawler-windows-portable"
+          if [ ! -d "$portable_dir" ]; then
+            echo "Missing portable zip artifact directory: $portable_dir" >&2
+            exit 1
+          fi
+          mapfile -t portable_zip_files < <(find "$portable_dir" -type f -name '*.zip' | sort)
+          if [ "${#portable_zip_files[@]}" -ne 1 ]; then
+            echo "Expected exactly one portable zip, found: ${#portable_zip_files[@]}" >&2
+            find "$portable_dir" -type f >&2
+            exit 1
+          fi
+          mv "${portable_zip_files[0]}" "dist/git-clawler-${GITHUB_REF_NAME}-windows-x86_64-portable.zip"
+          mv dist/gclawl-cli-linux/gclawl "dist/gclawl-${GITHUB_REF_NAME}-linux-x86_64"
+          mv dist/wsl-helper-musl/git-clawler-wsl-helper "dist/git-clawler-wsl-helper-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl"
+          rm -rf dist/git-clawler-msi dist/gclawl-cli-linux dist/wsl-helper-musl dist/git-clawler-windows-portable
+
+      - name: Add license and checksums
+        shell: bash
+        run: |
+          cp LICENSE dist/LICENSE
+          cp THIRD_PARTY_NOTICES.txt dist/THIRD_PARTY_NOTICES.txt
+          cd dist
+          sha256sum * > SHA256SUMS
+
+      - name: Create draft GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        with:
+          draft: true
+          body_path: RELEASE_NOTES.md
+          files: dist/*
+          tag_name: ${{ github.ref_name }}

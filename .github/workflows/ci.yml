@@ -1,0 +1,115 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  changes:
+    name: Classify changes
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.scope.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+      - name: Check change classification
+        run: python3 scripts/test-ci-build-scope.py
+      - id: scope
+        run: python3 scripts/ci-build-scope.py
+  rust:
+    name: Rust (${{ matrix.os }})
+    needs: changes
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Require successful change classification
+        if: needs.changes.result != 'success'
+        run: exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.changes.outputs.build != 'false'
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+        if: needs.changes.outputs.build != 'false'
+        with:
+          toolchain: 1.93.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        if: needs.changes.outputs.build != 'false'
+        with:
+          # PRs restore the main cache; avoid expensive PR-only cache uploads.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Install Linux build dependencies
+        if: needs.changes.outputs.build != 'false' && runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake pkg-config libssl-dev build-essential
+      - name: Install frontend dependencies for Windows context
+        if: needs.changes.outputs.build != 'false' && runner.os == 'Windows'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: crates/gui/.nvmrc
+      - name: Record Node runtime
+        if: needs.changes.outputs.build != 'false' && runner.os == 'Windows'
+        run: |
+          node --version
+          node -p "process.execPath"
+          npm --version
+      - name: Build frontend for Windows context
+        if: needs.changes.outputs.build != 'false' && runner.os == 'Windows'
+        working-directory: crates/gui
+        run: |
+          npm ci
+          npm run build
+      - name: Check formatting
+        if: needs.changes.outputs.build != 'false'
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        if: needs.changes.outputs.build != 'false'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run tests
+        if: needs.changes.outputs.build != 'false'
+        run: cargo test --workspace --locked
+      - name: Verify CLI cancellation in a terminal
+        if: needs.changes.outputs.build != 'false' && runner.os == 'Linux'
+        run: |
+          cargo build -p git-clawler --locked
+          python3 scripts/test-watch-cancellation.py
+  frontend:
+    name: Frontend
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful change classification
+        if: needs.changes.result != 'success'
+        run: exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.changes.outputs.build != 'false'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: needs.changes.outputs.build != 'false'
+        with:
+          node-version-file: crates/gui/.nvmrc
+      - name: Record Node runtime
+        if: needs.changes.outputs.build != 'false'
+        run: |
+          node --version
+          node -p "process.execPath"
+          npm --version
+      - working-directory: crates/gui
+        if: needs.changes.outputs.build != 'false'
+        run: npm ci
+      - working-directory: crates/gui
+        if: needs.changes.outputs.build != 'false'
+        run: npm test
+      - working-directory: crates/gui
+        if: needs.changes.outputs.build != 'false'
+        run: npm run build

@@ -1,0 +1,31 @@
+[package]
+name         = "git-clawler-core"
+description  = "Core library for git-clawler: multi-repo git status monitoring"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+authors      = { workspace = true }
+publish      = false
+
+[lib]
+name = "git_clawler_core"
+path = "src/lib.rs"
+
+[dependencies]
+tokio              = { workspace = true }
+anyhow             = { workspace = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+toml               = { workspace = true }
+git2               = { workspace = true }
+dirs               = { workspace = true }
+tracing            = { workspace = true }
+chrono             = { workspace = true }
+notify             = { workspace = true }
+
+[dev-dependencies]
+tempfile           = { workspace = true }
+tokio              = { workspace = true }

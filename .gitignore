@@ -1,0 +1,40 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+*.pem
+*.key
+
+# Node (Tauri frontend)
+node_modules/
+dist/
+!/crates/gui/frontend/dist/
+/crates/gui/frontend/dist/*
+!/crates/gui/frontend/dist/.gitkeep
+.parcel-cache/
+
+# Tauri
+/crates/gui/.tauri/
+
+# Logs
+*.log
+logs/
+
+# WSL helper binary (built by CI, placed here before Windows MSI build)
+/crates/gui/resources/wsl-helper/x86_64-unknown-linux-musl/git-clawler-wsl-helper
+
+/crates/gui/gen/

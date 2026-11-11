@@ -1,0 +1,70 @@
+[workspace]
+members = ["crates/core", "crates/cli", "crates/gui", "crates/wsl-helper"]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.93.1"
+license = "MIT"
+repository = "https://github.com/sahokun/git-clawler"
+authors = ["sahokun"]
+
+[workspace.dependencies]
+# ランタイム / IO
+tokio              = { version = "1.53.3", features = ["full"] }
+anyhow             = "1.0.103"
+thiserror          = "1"
+
+# シリアライズ / 設定
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+toml               = "0.8"
+
+# git
+git2               = { version = "0.21.0", default-features = false, features = ["https", "ssh", "vendored-libgit2", "vendored-openssl"] }
+
+# CLI
+clap               = { version = "4", features = ["derive"] }
+comfy-table        = "7"
+
+# 環境 / パス
+dirs               = "5"
+
+# ログ
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 日時
+chrono             = { version = "0.4", features = ["serde"] }
+
+# ファイル監視
+notify             = "6"
+
+# テスト補助
+tempfile           = "3"
+
+# CLI watch (TUI)
+crossterm          = { version = "0.28", features = ["event-stream"] }
+futures            = "0.3"
+ratatui            = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+
+# GUI (Windows / Tauri)
+tauri              = { version = "2.11.1", features = [] }
+tauri-build        = { version = "2", features = [] }
+
+# 内部 crate
+git-clawler-core   = { path = "crates/core" }
+
+[profile.dev]
+incremental = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# Temporary native security patches; provenance and removal criteria in vendor/README.md.
+[patch.crates-io]
+openssl-src = { path = "vendor/openssl-src" }
+libssh2-sys = { path = "vendor/libssh2-sys" }
