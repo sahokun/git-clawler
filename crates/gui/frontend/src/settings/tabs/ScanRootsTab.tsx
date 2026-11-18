@@ -3,6 +3,7 @@ import type { AppConfigDto, ScanRootEntryDto } from '@/types'
 import type { ValidationErrors } from '../settingsValidation'
 import { duplicatePathKey, normalizeDistro } from '../settingsValidation'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { pickDirectory, scanRoot } from '@/api'
@@ -45,7 +46,10 @@ export function ScanRootsTab({ draft, onChange, errors }: Props) {
     onChange(
       current => ({
         ...current,
-        scan_roots: [...current.scan_roots, { path: '', depth: 3, exclude: [], distro: null }],
+        scan_roots: [
+          ...current.scan_roots,
+          { path: '', depth: 1, exclude: [], distro: null, auto: true, worktrees: true },
+        ],
       }),
       true,
     )
@@ -179,8 +183,30 @@ export function ScanRootsTab({ draft, onChange, errors }: Props) {
                 onChange={e => update(i, { distro: normalizeDistro(e.target.value) }, false)}
               />
             </div>
+            <div className="flex flex-wrap items-center gap-4">
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id={`scan-root-auto-${i}`}
+                  checked={root.auto !== false}
+                  onCheckedChange={checked => update(i, { auto: checked === true }, true)}
+                />
+                <Label htmlFor={`scan-root-auto-${i}`}>
+                  Auto-follow (register new repositories automatically)
+                </Label>
+              </div>
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id={`scan-root-worktrees-${i}`}
+                  checked={root.worktrees !== false}
+                  onCheckedChange={checked => update(i, { worktrees: checked === true }, true)}
+                />
+                <Label htmlFor={`scan-root-worktrees-${i}`}>Include linked worktrees</Label>
+              </div>
+            </div>
             <div className="space-y-1">
-              <Label htmlFor={`scan-root-exclude-${i}`}>Exclude (comma-separated)</Label>
+              <Label htmlFor={`scan-root-exclude-${i}`}>
+                Exclude (comma-separated: folder names, paths relative to the root, or absolute paths)
+              </Label>
               <Input
                 id={`scan-root-exclude-${i}`}
                 value={root.exclude.join(', ')}

@@ -14,30 +14,26 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
-  # EXCEPTION: zbus 5 maintenance notices, not reachable on supported targets.
-  # GUI notification plugin is Windows-only; notify-rust enables zbus only on Unix.
-  # Tracking: https://github.com/sahokun/git-clawler/issues/5; expires 2027-01-10.
-  # Reevaluate before enabling Linux GUI or adding any other zbus dependency path.
+  # EXCEPTION: crates reachable only through Tauri's Linux GUI dependencies.
+  # git-clawler-gui depends on Tauri only on Windows; the Linux CLI/helper do not.
+  # `cargo tree --target {x86_64-pc-windows-msvc,x86_64-unknown-linux-gnu,
+  # x86_64-unknown-linux-musl}` shows none of these crates (reviewed 2026-11-16).
+  # They stay in Cargo.lock, so `cargo audit` (no target filter) still reports them.
+  # Tracking: https://github.com/sahokun/git-clawler/issues/5
+  # Review expires 2027-04-10. Reevaluate before enabling Linux GUI support.
+  # zbus 5: tauri-plugin-notification 2.8.x requires zbus ^5 directly on Linux,
+  # so notify-rust 4.19 (zbus 6) alone cannot remove these.
   "RUSTSEC-2026-0370", # zvariant merged into zbus 6
   "RUSTSEC-2026-0371", # zbus_names merged into zbus 6
   "RUSTSEC-2026-0372", # zvariant_derive merged into zbus 6
-  # EXCEPTION: Tauri maintenance warnings on Windows; no safe upstream upgrade.
-  # Target: Windows GUI build/runtime. Tracking: https://github.com/sahokun/git-clawler/issues/5
-  # Review expires 2027-01-10. Remove each entry when Tauri replaces the dependency.
-  "RUSTSEC-2025-0098", # unic-ucd-version (unmaintained)
-  "RUSTSEC-2025-0100", # unic-ucd-ident (unmaintained)
-  "RUSTSEC-2025-0081", # unic-char-property (unmaintained)
-  "RUSTSEC-2025-0080", # unic-common (unmaintained)
-  "RUSTSEC-2025-0075", # unic-char-range (unmaintained)
-  "RUSTSEC-2025-0057", # fxhash (unmaintained)
-  "RUSTSEC-2024-0370", # proc-macro-error (build-only, unmaintained)
-  # EXCEPTION: glib is only in unsupported Linux GUI dependencies in Cargo.lock.
-  # Neither the Linux CLI/helper nor Windows GUI links this code. Same review/issue.
-  "RUSTSEC-2024-0429",
-  # EXCEPTION: rand 0.7 is build-only through selectors/phf_generator on Windows.
-  # Uses SmallRng without log; the thread_rng + reentrant logger condition is absent.
-  # Same review deadline and tracking issue. Regression review includes cargo tree -e features.
-  "RUSTSEC-2026-0097",
+  # gtk-rs 0.18 (GTK3): tray-icon 0.26 still requires gtk ^0.18 on Linux.
+  "RUSTSEC-2024-0429", # glib 0.18 VariantStrIter unsoundness
+  "RUSTSEC-2024-0370", # proc-macro-error (unmaintained) via glib-macros 0.18
+  # EXCEPTION: chrono is unmaintained (informational, no known vulnerability).
+  # Used directly by our crates for UTC timestamps, RFC 3339 and local display.
+  # Tracking: https://github.com/sahokun/git-clawler/issues/61 (migrate to jiff)
+  # Review expires 2027-02-18.
+  "RUSTSEC-2026-0543", # chrono unmaintained
 ]
 
 [licenses]

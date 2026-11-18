@@ -49,7 +49,10 @@ pub struct ScanOptions {
     /// Depth 0 = root itself is examined; depth N means repos may exist up to
     /// N directory levels below root (inclusive). `0` means only root is examined.
     pub max_depth: u32,
-    /// Basenames to skip during traversal (e.g. `node_modules`, `target`).
+    /// Entries to skip during traversal. A plain name (e.g. `node_modules`)
+    /// matches a directory basename at any level; an entry containing `/` or
+    /// `\\` is a path relative to the scan root; an absolute path matches that
+    /// exact directory.
     pub excludes: Vec<String>,
     /// Whether to follow symbolic links when traversing.
     pub follow_symlinks: bool,
@@ -106,6 +109,71 @@ pub(crate) fn matches_exclude(excludes: &HashSet<String>, name: &str) -> bool {
     }
 }
 
+/// True when an exclude entry names a path rather than a basename.
+pub fn is_path_exclude(entry: &str) -> bool {
+    entry.contains('/') || entry.contains('\\') || Path::new(entry).is_absolute()
+}
+
+/// Resolve path-style excludes against `root` into comparable keys.
+pub(crate) fn path_exclude_keys(root: &Path, excludes: &[String]) -> HashSet<String> {
+    excludes
+        .iter()
+        .filter(|e| is_path_exclude(e))
+        .map(|e| {
+            let trimmed = e.trim_end_matches(['/', '\\']);
+            let candidate = Path::new(trimmed);
+            if candidate.is_absolute() || trimmed.starts_with('/') {
+                identity_key(candidate)
+            } else {
+                let mut joined = root.to_path_buf();
+                for part in trimmed
+                    .split(['/', '\\'])
+                    .filter(|p| !p.is_empty() && *p != ".")
+                {
+                    joined.push(part);
+                }
+                identity_key(&joined)
+            }
+        })
+        .collect()
+}
+
+/// Key identifying the same directory regardless of spelling: resolves
+/// symlinks and Windows 8.3 short names when the path exists, then applies
+/// [`path_compare_key`]. Falls back to the literal path when it does not exist.
+pub(crate) fn identity_key(path: &Path) -> String {
+    match std::fs::canonicalize(path) {
+        Ok(real) => {
+            let text = real.to_string_lossy();
+            // Drop the Windows verbatim prefix so canonical and literal keys agree.
+            let text = text
+                .strip_prefix(r"\\?\UNC\")
+                .map(|rest| format!(r"\\{rest}"))
+                .or_else(|| text.strip_prefix(r"\\?\").map(str::to_string))
+                .unwrap_or_else(|| text.into_owned());
+            path_compare_key(Path::new(&text))
+        }
+        Err(_) => path_compare_key(path),
+    }
+}
+
+/// Separator- and (on Windows) case-insensitive comparison key for a path.
+pub(crate) fn path_compare_key(path: &Path) -> String {
+    let text = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    #[cfg(target_os = "windows")]
+    {
+        text.to_ascii_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        text
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scanner
 // ---------------------------------------------------------------------------
@@ -145,7 +213,13 @@ pub fn scan_for_repos(root: &Path, opts: &ScanOptions) -> Result<Vec<PathBuf>, S
         return Ok(vec![root.to_path_buf()]);
     }
 
-    let exclude_set: HashSet<String> = opts.excludes.iter().cloned().collect();
+    let exclude_set: HashSet<String> = opts
+        .excludes
+        .iter()
+        .filter(|e| !is_path_exclude(e))
+        .cloned()
+        .collect();
+    let excluded_paths = path_exclude_keys(root, &opts.excludes);
     let mut results: BTreeSet<PathBuf> = BTreeSet::new();
     let mut visited: HashSet<PathBuf> = HashSet::new();
     if opts.follow_symlinks {
@@ -225,6 +299,9 @@ pub fn scan_for_repos(root: &Path, opts: &ScanOptions) -> Result<Vec<PathBuf>, S
                 continue;
             }
             if matches_exclude(&exclude_set, &name) {
+                continue;
+            }
+            if !excluded_paths.is_empty() && excluded_paths.contains(&identity_key(&path)) {
                 continue;
             }
 

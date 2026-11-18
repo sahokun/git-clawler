@@ -74,65 +74,80 @@ pub fn get_origin_url_sync(repo_path: &std::path::Path) -> Option<String> {
     remote.url().ok().map(str::to_string)
 }
 
-/// High-level GitHub enrichment helper for one repository.
+/// `(owner, name)` of a GitHub repository.
+pub type RepoSlug = (String, String);
+
+/// Upper bound on repositories per GraphQL request (keeps the query and
+/// command line small and the per-request cost modest).
+pub const GITHUB_BATCH_MAX: usize = 50;
+
+/// Issue/PR counts for several repositories in one `gh api graphql` call.
 ///
-/// Calls [`fetch_counts_with_token_env`] internally and masks fields by
-/// `cfg.enable_issues` / `cfg.enable_prs`. Returns `None` on any error
-/// (including non-GitHub URLs); non-GitHub-remote errors are silent, others
-/// are logged at `debug!`.
-pub async fn fetch_counts_for_remote(
-    remote_url: &str,
+/// Returns one entry per input slug, in order; fields are masked by
+/// `cfg.enable_issues` / `cfg.enable_prs`. A repository GitHub cannot resolve
+/// (deleted, renamed, no access) yields `None` without failing the others;
+/// a failure of the whole request yields all `None` (logged at `debug!`).
+pub async fn fetch_infos_batch(
+    slugs: &[RepoSlug],
     cfg: &crate::config::GithubConfig,
-) -> Option<crate::GithubInfo> {
-    match fetch_counts_with_token_env(remote_url, &cfg.token_env).await {
-        Ok(counts) => Some(crate::GithubInfo {
-            open_issues: cfg.enable_issues.then_some(counts.open_issues),
-            open_prs: cfg.enable_prs.then_some(counts.open_prs),
-        }),
-        Err(GhError::NotGithubRemote) => None,
+) -> Vec<Option<crate::GithubInfo>> {
+    let token = std::env::var(&cfg.token_env).ok();
+    match fetch_counts_batch(slugs, token.as_deref()).await {
+        Ok(counts) => counts
+            .into_iter()
+            .map(|c| {
+                c.map(|c| crate::GithubInfo {
+                    open_issues: cfg.enable_issues.then_some(c.open_issues),
+                    open_prs: cfg.enable_prs.then_some(c.open_prs),
+                })
+            })
+            .collect(),
         Err(e) => {
-            tracing::debug!(error = %e, "fetch_counts_for_remote skipped");
-            None
+            tracing::debug!(error = %e, repos = slugs.len(), "GitHub batch lookup skipped");
+            vec![None; slugs.len()]
         }
     }
 }
 
-pub async fn fetch_counts(remote_url: &str) -> Result<GhCounts, GhError> {
-    fetch_counts_with_token(remote_url, None).await
+/// GraphQL document with one aliased `repository` field per slug; owners and
+/// names are passed as variables (`o0`/`n0`, …), never interpolated.
+fn batch_query(count: usize) -> String {
+    let vars = (0..count)
+        .map(|i| format!("$o{i}: String!, $n{i}: String!"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let fields = (0..count)
+        .map(|i| {
+            format!(
+                "r{i}: repository(owner: $o{i}, name: $n{i}) {{ issues(states: OPEN) {{ totalCount }} pullRequests(states: OPEN) {{ totalCount }} }}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("query({vars}) {{\n{fields}\n}}")
 }
 
-pub async fn fetch_counts_with_token_env(
-    remote_url: &str,
-    token_env: &str,
-) -> Result<GhCounts, GhError> {
-    let token = std::env::var(token_env).ok();
-    fetch_counts_with_token(remote_url, token.as_deref()).await
-}
-
-async fn fetch_counts_with_token(
-    remote_url: &str,
+async fn fetch_counts_batch(
+    slugs: &[RepoSlug],
     token: Option<&str>,
-) -> Result<GhCounts, GhError> {
-    let (owner, name) = parse_owner_repo(remote_url).ok_or(GhError::NotGithubRemote)?;
-    let query = r#"
-query($owner: String!, $name: String!) {
-  repository(owner: $owner, name: $name) {
-    issues(states: OPEN) { totalCount }
-    pullRequests(states: OPEN) { totalCount }
-  }
-}
-"#;
-
+) -> Result<Vec<Option<GhCounts>>, GhError> {
+    if slugs.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut command = Command::new("gh");
     command
         .arg("api")
         .arg("graphql")
         .arg("-f")
-        .arg(format!("query={query}"))
-        .arg("-f")
-        .arg(format!("owner={owner}"))
-        .arg("-f")
-        .arg(format!("name={name}"))
+        .arg(format!("query={}", batch_query(slugs.len())));
+    for (i, (owner, name)) in slugs.iter().enumerate() {
+        command
+            .arg("-f")
+            .arg(format!("o{i}={owner}"))
+            .arg("-f")
+            .arg(format!("n{i}={name}"));
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -164,29 +179,29 @@ query($owner: String!, $name: String!) {
             }
         })?;
 
-    if !output.status.success() {
-        if output.status.code() == Some(4) {
-            return Err(GhError::NotAuthenticated);
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(GhError::Api(if stderr.is_empty() {
-            format!("gh exited with {}", output.status)
-        } else {
-            stderr
-        }));
+    if output.status.code() == Some(4) {
+        return Err(GhError::NotAuthenticated);
     }
-
-    parse_counts(&output.stdout)
+    // gh exits non-zero when any alias fails (e.g. a deleted repository) but
+    // still prints the partial `data`, so parse stdout regardless of status.
+    parse_batch_counts(&output.stdout, slugs.len()).map_err(|e| {
+        if output.status.success() {
+            e
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            GhError::Api(if stderr.is_empty() {
+                format!("gh exited with {}", output.status)
+            } else {
+                stderr
+            })
+        }
+    })
 }
 
-fn parse_counts(bytes: &[u8]) -> Result<GhCounts, GhError> {
+fn parse_batch_counts(bytes: &[u8], count: usize) -> Result<Vec<Option<GhCounts>>, GhError> {
     #[derive(Deserialize)]
     struct Response {
-        data: Data,
-    }
-    #[derive(Deserialize)]
-    struct Data {
-        repository: Repository,
+        data: Option<std::collections::HashMap<String, Option<Repository>>>,
     }
     #[derive(Deserialize)]
     struct Repository {
@@ -202,10 +217,17 @@ fn parse_counts(bytes: &[u8]) -> Result<GhCounts, GhError> {
 
     let response: Response =
         serde_json::from_slice(bytes).map_err(|e| GhError::Api(e.to_string()))?;
-    Ok(GhCounts {
-        open_issues: response.data.repository.issues.total_count,
-        open_prs: response.data.repository.pull_requests.total_count,
-    })
+    let mut data = response
+        .data
+        .ok_or_else(|| GhError::Api("GraphQL response has no data".to_string()))?;
+    Ok((0..count)
+        .map(|i| {
+            data.remove(&format!("r{i}")).flatten().map(|r| GhCounts {
+                open_issues: r.issues.total_count,
+                open_prs: r.pull_requests.total_count,
+            })
+        })
+        .collect())
 }
 
 // gh may invoke a credential/browser helper. Killing only gh leaves that helper
@@ -272,24 +294,52 @@ mod tests {
     }
 
     #[test]
-    fn parse_counts_reads_graphql_response() {
+    fn batch_query_uses_one_alias_and_variable_pair_per_repo() {
+        let q = batch_query(2);
+        assert!(q.starts_with("query($o0: String!, $n0: String!, $o1: String!, $n1: String!)"));
+        assert!(q.contains("r0: repository(owner: $o0, name: $n0)"));
+        assert!(q.contains("r1: repository(owner: $o1, name: $n1)"));
+        assert!(!q.contains("r2:"));
+    }
+
+    #[test]
+    fn parse_batch_counts_keeps_order_and_tolerates_unresolved_repos() {
+        // Shape gh prints (exit 1) when one alias cannot be resolved.
         let json = br#"{
           "data": {
-            "repository": {
-              "issues": { "totalCount": 12 },
-              "pullRequests": { "totalCount": 3 }
-            }
-          }
+            "r1": null,
+            "r0": { "issues": { "totalCount": 12 }, "pullRequests": { "totalCount": 3 } },
+            "r2": { "issues": { "totalCount": 0 }, "pullRequests": { "totalCount": 1 } }
+          },
+          "errors": [{ "type": "NOT_FOUND", "path": ["r1"], "message": "Could not resolve" }]
         }"#;
-        let counts = parse_counts(json).expect("parse counts");
-        assert_eq!(counts.open_issues, 12);
-        assert_eq!(counts.open_prs, 3);
+        let counts = parse_batch_counts(json, 3).expect("parse counts");
+        assert_eq!(
+            counts,
+            vec![
+                Some(GhCounts {
+                    open_issues: 12,
+                    open_prs: 3
+                }),
+                None,
+                Some(GhCounts {
+                    open_issues: 0,
+                    open_prs: 1
+                }),
+            ]
+        );
     }
+
     #[test]
-    fn fetch_counts_for_remote_non_github_returns_none_sync() {
-        // parse_owner_repo returns None for non-GitHub → NotGithubRemote → None
-        // We test this via fetch_counts_for_remote via the underlying parse path.
-        // The function is async so we test parse_owner_repo directly for the None case.
+    fn parse_batch_counts_rejects_responses_without_data() {
+        let json = br#"{ "errors": [{ "message": "Bad credentials" }] }"#;
+        assert!(parse_batch_counts(json, 1).is_err());
+        assert!(parse_batch_counts(b"not json", 1).is_err());
+    }
+
+    #[test]
+    fn non_github_remotes_have_no_slug() {
+        // Rows without a slug are never sent to GitHub.
         assert_eq!(parse_owner_repo("https://gitlab.com/owner/repo"), None);
     }
 }

@@ -22,6 +22,8 @@ jobs:
           fetch-depth: 2
       - name: Check change classification
         run: python3 scripts/test-ci-build-scope.py
+      - name: Test merge-when-green script
+        run: python3 scripts/test-merge-when-green.py
       - id: scope
         run: python3 scripts/ci-build-scope.py
   rust:

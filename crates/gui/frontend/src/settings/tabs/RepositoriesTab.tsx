@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { pickDirectory } from '@/api'
+import { pickDirectory, removeRepository } from '@/api'
 import { Folder, Plus, Trash2 } from 'lucide-react'
 
 interface Props {
@@ -28,14 +28,29 @@ export function RepositoriesTab({ draft, onChange, errors }: Props) {
     )
   }
 
-  const remove = (i: number) => {
+  const removeFromDraft = (path: string, distro: string | null) => {
     onChange(
       current => ({
         ...current,
-        repositories: current.repositories.filter((_, idx) => idx !== i),
+        repositories: current.repositories.filter(r => !(r.path === path && r.distro === distro)),
       }),
       true,
     )
+  }
+
+  // Saved entries are removed through the backend so an auto scan root gets an
+  // exclusion and does not re-add them; unsaved rows only leave the draft.
+  const remove = async (i: number) => {
+    const entry = draft.repositories[i]
+    if (!entry) return
+    if (entry.path.trim() !== '') {
+      try {
+        await removeRepository(entry.path, entry.distro)
+      } catch {
+        // Not registered yet (unsaved row): fall through to the draft change.
+      }
+    }
+    removeFromDraft(entry.path, entry.distro)
   }
 
   const add = () => {

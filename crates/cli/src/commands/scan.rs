@@ -258,6 +258,7 @@ mod tests {
         let cfg_path = cfg_dir.path().join("config.toml");
         let initial_config = git_clawler_core::AppConfig {
             repositories: vec![git_clawler_core::config::RepoEntry {
+                worktree_of: None,
                 name: Some("real".into()),
                 path: alias.clone(),
                 fetch: None,

@@ -27,7 +27,11 @@ pub enum StatusError {
     #[error("repository path must be absolute: {0}")]
     RelativePath(PathBuf),
 
-    /// The path does not point to a git repository (or does not exist).
+    /// The path does not exist.
+    #[error("path not found: {0}")]
+    PathNotFound(PathBuf),
+
+    /// The path exists but is not a git repository.
     #[error("not a git repository: {0}")]
     NotARepository(PathBuf),
 
@@ -77,6 +81,11 @@ enum HeadState {
 fn open_repo(path: &Path) -> Result<git2::Repository, StatusError> {
     if !path.is_absolute() {
         return Err(StatusError::RelativePath(path.to_path_buf()));
+    }
+    // `try_exists` distinguishes a missing path from an unreadable one; only a
+    // definite "does not exist" is reported as PathNotFound.
+    if matches!(path.try_exists(), Ok(false)) {
+        return Err(StatusError::PathNotFound(path.to_path_buf()));
     }
 
     match git2::Repository::open(path) {
@@ -482,7 +491,37 @@ pub(crate) fn scan_cancellable(
         github: None,
         conflict_predicted,
         recent_commits,
+        worktree_parent: if is_linked {
+            worktree_parent_of(&repo)
+        } else {
+            None
+        },
     })
+}
+
+/// Working directory of the main repository that owns a linked worktree.
+///
+/// `commondir()` is the main repository's git directory (normally
+/// `<main>/.git/`); opening it yields the main working directory.
+pub fn worktree_parent_of(repo: &git2::Repository) -> Option<PathBuf> {
+    let common = repo.commondir();
+    let main = git2::Repository::open(common).ok()?;
+    main.workdir().map(normalize_workdir)
+}
+
+/// Strip the trailing separator git2 leaves on working directories.
+pub(crate) fn normalize_workdir(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let trimmed = text.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return path.to_path_buf();
+    }
+    // git reports Windows paths with forward slashes; store native separators.
+    if cfg!(windows) {
+        PathBuf::from(trimmed.replace('/', "\\"))
+    } else {
+        PathBuf::from(trimmed)
+    }
 }
 
 /// Best-effort `git fetch` of the current branch's upstream remote.
@@ -719,8 +758,8 @@ mod tests {
         };
         let result = scan(&path);
         assert!(
-            matches!(result, Err(StatusError::NotARepository(_))),
-            "expected NotARepository, got {result:?}"
+            matches!(result, Err(StatusError::PathNotFound(_))),
+            "expected PathNotFound, got {result:?}"
         );
     }
 

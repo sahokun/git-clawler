@@ -462,6 +462,16 @@ fn validate_required_handshake(handshake: &HelperHandshake) -> Result<(), Bootst
             name: "populates_recent_commits",
         });
     }
+    if !handshake.capabilities.discovers_roots {
+        return Err(BootstrapError::MissingCapability {
+            name: "discovers_roots",
+        });
+    }
+    if !handshake.capabilities.reports_worktrees {
+        return Err(BootstrapError::MissingCapability {
+            name: "reports_worktrees",
+        });
+    }
     Ok(())
 }
 
@@ -738,6 +748,8 @@ mod tests {
     async fn bootstrap_skips_when_version_and_capability_present() {
         let _env = lock_helper_env().await;
         let caps = HelperCapabilities {
+            discovers_roots: true,
+            reports_worktrees: true,
             populates_remote_url: true,
             scans_roots: true,
             populates_recent_commits: true,
@@ -762,11 +774,15 @@ mod tests {
     async fn bootstrap_reinstalls_when_capability_missing() {
         let _env = lock_helper_env().await;
         let caps_old = HelperCapabilities {
+            discovers_roots: true,
+            reports_worktrees: true,
             populates_remote_url: false,
             scans_roots: false,
             populates_recent_commits: false,
         };
         let caps_new = HelperCapabilities {
+            discovers_roots: true,
+            reports_worktrees: true,
             populates_remote_url: true,
             scans_roots: true,
             populates_recent_commits: true,
@@ -795,11 +811,15 @@ mod tests {
     async fn bootstrap_reinstalls_when_scan_root_capability_missing() {
         let _env = lock_helper_env().await;
         let caps_old = HelperCapabilities {
+            discovers_roots: true,
+            reports_worktrees: true,
             populates_remote_url: true,
             scans_roots: false,
             populates_recent_commits: false,
         };
         let caps_new = HelperCapabilities {
+            discovers_roots: true,
+            reports_worktrees: true,
             populates_remote_url: true,
             scans_roots: true,
             populates_recent_commits: true,
@@ -825,6 +845,8 @@ mod tests {
     async fn bootstrap_errors_when_post_install_capability_missing() {
         let _env = lock_helper_env().await;
         let caps_missing = HelperCapabilities {
+            discovers_roots: true,
+            reports_worktrees: true,
             populates_remote_url: false,
             scans_roots: false,
             populates_recent_commits: false,
@@ -867,6 +889,8 @@ mod tests {
 
     fn valid_caps() -> HelperCapabilities {
         HelperCapabilities {
+            discovers_roots: true,
+            reports_worktrees: true,
             populates_remote_url: true,
             scans_roots: true,
             populates_recent_commits: true,
@@ -905,6 +929,8 @@ mod tests {
             protocol_version: git_clawler_wsl_helper::PROTOCOL_VERSION,
             helper_version: HELPER_VERSION.to_string(),
             capabilities: HelperCapabilities {
+                discovers_roots: true,
+                reports_worktrees: true,
                 populates_remote_url: false,
                 scans_roots: false,
                 populates_recent_commits: false,

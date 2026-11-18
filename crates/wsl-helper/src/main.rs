@@ -1,6 +1,7 @@
 use clap::Parser;
 use git_clawler_wsl_helper::{
-    run_scan, run_scan_root, ScanResponse, ScanRootResponse, HELPER_VERSION, PROTOCOL_VERSION,
+    run_discover, run_scan, run_scan_root, run_worktree_gone, DiscoverResponse, ScanResponse,
+    ScanRootResponse, WorktreeGoneResponse, HELPER_VERSION, PROTOCOL_VERSION,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -31,9 +32,29 @@ struct Cli {
     #[arg(long, default_value_t = 3)]
     depth: u32,
 
-    /// Basename to exclude during --scan-root traversal. May be repeated.
+    /// Exclusion for --scan-root/--discover: a directory name, a path relative
+    /// to the root, or an absolute path. May be repeated.
     #[arg(long = "exclude", value_name = "NAME")]
     exclude: Vec<String>,
+
+    /// Discover repositories and their linked worktrees below this root.
+    #[arg(long, value_name = "ROOT")]
+    discover: Option<PathBuf>,
+
+    /// With --discover: do not report linked worktrees.
+    #[arg(long, default_value_t = false)]
+    no_worktrees: bool,
+
+    /// Report which registered worktrees Git no longer tracks. Pair each
+    /// --worktree with a --parent (main repository) in the same order.
+    #[arg(long, default_value_t = false)]
+    worktree_gone: bool,
+
+    #[arg(long = "worktree", value_name = "PATH")]
+    worktrees: Vec<PathBuf>,
+
+    #[arg(long = "parent", value_name = "PATH")]
+    parents: Vec<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -68,6 +89,8 @@ fn main() -> ExitCode {
                 populates_remote_url: true,
                 scans_roots: true,
                 populates_recent_commits: true,
+                discovers_roots: true,
+                reports_worktrees: true,
             },
         };
         println!("{}", serde_json::to_string(&handshake).unwrap());
@@ -110,12 +133,31 @@ fn main() -> ExitCode {
         }
     };
 
-    if cli.scan_root.is_some() && !cli.paths.is_empty() {
-        eprintln!("--scan-root cannot be combined with repository path arguments");
+    let modes = usize::from(cli.scan_root.is_some())
+        + usize::from(cli.discover.is_some())
+        + usize::from(cli.worktree_gone);
+    if modes > 1 || (modes == 1 && !cli.paths.is_empty()) {
+        eprintln!(
+            "--scan-root, --discover and --worktree-gone are mutually exclusive and cannot be combined with repository paths"
+        );
+        return ExitCode::from(2);
+    }
+    if cli.worktrees.len() != cli.parents.len() {
+        eprintln!("each --worktree needs a matching --parent");
         return ExitCode::from(2);
     }
 
-    let response = if let Some(root) = cli.scan_root {
+    let response = if let Some(root) = cli.discover {
+        HelperOutput::Discover(rt.block_on(run_discover(
+            root,
+            cli.depth,
+            cli.exclude,
+            !cli.no_worktrees,
+        )))
+    } else if cli.worktree_gone {
+        let pairs = cli.worktrees.into_iter().zip(cli.parents).collect();
+        HelperOutput::Gone(rt.block_on(run_worktree_gone(pairs)))
+    } else if let Some(root) = cli.scan_root {
         HelperOutput::Root(rt.block_on(run_scan_root(root, cli.depth, cli.exclude)))
     } else {
         HelperOutput::Repos(rt.block_on(run_scan(cli.paths, cli.fetch)))
@@ -135,6 +177,8 @@ fn main() -> ExitCode {
 enum HelperOutput {
     Repos(ScanResponse),
     Root(ScanRootResponse),
+    Discover(DiscoverResponse),
+    Gone(WorktreeGoneResponse),
 }
 
 impl HelperOutput {
@@ -142,6 +186,8 @@ impl HelperOutput {
         match self {
             Self::Repos(response) => serde_json::to_string(response),
             Self::Root(response) => serde_json::to_string(response),
+            Self::Discover(response) => serde_json::to_string(response),
+            Self::Gone(response) => serde_json::to_string(response),
         }
     }
 }

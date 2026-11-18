@@ -44,7 +44,7 @@ fn t3_relative_path_yields_relative_path_err() {
 }
 
 #[test]
-fn t4_nonexistent_dir_yields_not_a_repository() {
+fn t4_nonexistent_dir_yields_path_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("does-not-exist");
     let path_str = path.to_string_lossy().into_owned();
@@ -52,10 +52,7 @@ fn t4_nonexistent_dir_yields_not_a_repository() {
     assert_eq!(code, 0);
     let v: Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(v["results"][0]["status"]["kind"], "err");
-    assert_eq!(
-        v["results"][0]["status"]["value"]["code"],
-        "not_a_repository"
-    );
+    assert_eq!(v["results"][0]["status"]["value"]["code"], "path_not_found");
 }
 
 #[test]
@@ -160,7 +157,41 @@ fn t14_scan_root_cannot_combine_with_paths() {
     let root = dir.path().to_string_lossy().into_owned();
     let (code, _stdout, stderr) = run(&["--scan-root", &root, &root]);
     assert_eq!(code, 2);
-    assert!(stderr.contains("--scan-root cannot be combined"));
+    assert!(stderr.contains("mutually exclusive"));
+}
+
+#[test]
+fn t15_discover_and_worktree_gone_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git2::Repository::init(&repo).unwrap();
+    let root = dir.path().to_string_lossy().into_owned();
+    let (code, stdout, _stderr) = run(&["--discover", &root, "--depth", "1"]);
+    assert_eq!(code, 0);
+    let v: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["status"]["kind"], "ok");
+    assert_eq!(
+        v["status"]["value"][0]["path"],
+        repo.to_string_lossy().as_ref()
+    );
+
+    let (code, _stdout, stderr) = run(&["--discover", &root, "--scan-root", &root]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("mutually exclusive"));
+
+    let (code, _stdout, stderr) = run(&["--worktree-gone", "--worktree", "/x"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("matching --parent"));
+}
+
+#[test]
+fn t16_handshake_advertises_discovery_capabilities() {
+    let (code, stdout, _stderr) = run(&["--protocol"]);
+    assert_eq!(code, 0);
+    let v: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["capabilities"]["discovers_roots"], true);
+    assert_eq!(v["capabilities"]["reports_worktrees"], true);
 }
 #[test]
 fn t11_relative_path_emits_warning_to_stderr() {

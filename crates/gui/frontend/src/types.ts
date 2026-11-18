@@ -29,7 +29,8 @@ export interface RepoStatusDto {
 
 export type RowStatus =
   | { kind: "ok"; value: RepoStatusDto }
-  | { kind: "err"; value: string };
+  | { kind: "err"; value: string }
+  | { kind: "not_found"; value: string };
 
 export interface RepoRow {
   index: number;
@@ -40,6 +41,8 @@ export interface RepoRow {
   status: RowStatus;
   distro: string | null;
   remote_url: string | null;
+  /** Main repository path when this row is a linked worktree. */
+  worktree_of?: string | null;
 }
 
 export interface ListRepositoriesResponse {
@@ -81,6 +84,8 @@ export interface RepoEntryDto {
   path: string;
   fetch: boolean | null;
   distro: string | null;
+  /** Main repository path for an auto-registered linked worktree. */
+  worktree_of?: string | null;
 }
 
 export interface ScanRootEntryDto {
@@ -88,6 +93,10 @@ export interface ScanRootEntryDto {
   depth: number;
   exclude: string[];
   distro: string | null;
+  /** Automatically register repositories discovered under this root (default true). */
+  auto?: boolean;
+  /** Also register linked worktrees of discovered repositories (default true). */
+  worktrees?: boolean;
 }
 
 export interface GithubConfigDto {

@@ -5,7 +5,7 @@ import type {AppConfigDto} from '@/types'
 import {SettingsDialog} from '../SettingsDialog'
 import {saveConfig} from '@/api'
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT=true
-vi.mock('@/api',()=>({getConfig:vi.fn(async()=>config()),saveConfig:vi.fn(async()=>{throw {kind:'internal',message:'fixture write denied'}})}))
+vi.mock('@/api',()=>({subscribeConfigRepositoriesChanged:vi.fn(async()=>()=>{}),getConfig:vi.fn(async()=>config()),saveConfig:vi.fn(async()=>{throw {kind:'internal',message:'fixture write denied'}})}))
 vi.mock('@/components/ui/dialog',()=>({Dialog:({open,onOpenChange,children}:any)=>open?<div><button id="close" onClick={()=>onOpenChange(false)}>close</button>{children}</div>:null,DialogContent:({children}:any)=><div>{children}</div>,DialogDescription:({children}:any)=><div>{children}</div>,DialogHeader:({children}:any)=><div>{children}</div>,DialogTitle:({children}:any)=><div>{children}</div>}))
 vi.mock('../tabs/GeneralTab',()=>({GeneralTab:({draft,onChange}:any)=><button id="edit" onClick={()=>onChange({...draft,general:{...draft.general,refresh_interval_secs:99}},false)}>edit {draft.general.refresh_interval_secs}</button>}))
 function config(refreshIntervalSecs = 30): AppConfigDto {

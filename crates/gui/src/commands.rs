@@ -190,19 +190,51 @@ pub async fn list_repositories_inner_with_config(
         git_clawler_core::list::enrich_with_github(&mut all_rows, &config.github).await;
     }
 
-    // 5) Sort by registry index and convert to RepoRow DTOs.
+    // 5) Sort by registry index, count worktree branches once, and convert
+    //    to RepoRow DTOs.
     all_rows.sort_by_key(|r| r.target.index);
+    git_clawler_core::list::dedupe_worktree_branches(&mut all_rows);
+    let configured_parents: std::collections::HashMap<DistroPathKey, PathBuf> = config
+        .repositories
+        .iter()
+        .filter_map(|r| {
+            r.worktree_of.clone().map(|parent| {
+                (
+                    DistroPathKey::current_host(
+                        crate::wsl::normalize_distro(r.distro.clone()).as_deref(),
+                        &r.path,
+                    ),
+                    parent,
+                )
+            })
+        })
+        .collect();
     let rows: Vec<RepoRow> = all_rows
         .into_iter()
         .map(|row| {
             let distro = row.target.distro.clone();
+            let configured_parent = configured_parents
+                .get(&DistroPathKey::current_host(
+                    distro.as_deref(),
+                    &row.target.path,
+                ))
+                .cloned();
             let remote_url = row.remote_url.clone().or_else(|| {
                 (!crate::wsl::is_wsl_path(&row.target.path))
                     .then(|| git_clawler_core::github::get_origin_url_sync(&row.target.path))
                     .flatten()
             });
+            let mut worktree_of = configured_parent;
             let status = match row.outcome {
-                ScanOutcome::Ok(s) => RowStatus::Ok(repo_status_to_dto(s)),
+                ScanOutcome::Ok(s) => {
+                    if s.worktree_parent.is_some() {
+                        worktree_of = s.worktree_parent.clone();
+                    }
+                    RowStatus::Ok(repo_status_to_dto(s))
+                }
+                ScanOutcome::Err(e) if row_not_found(distro.as_deref(), &row.target.path, &e) => {
+                    RowStatus::NotFound(e)
+                }
                 ScanOutcome::Err(e) => RowStatus::Err(e),
             };
             RepoRow {
@@ -214,11 +246,23 @@ pub async fn list_repositories_inner_with_config(
                 status,
                 distro,
                 remote_url,
+                worktree_of: worktree_of.map(|p| p.to_string_lossy().into_owned()),
             }
         })
         .collect();
 
     Ok(ListRepositoriesResponse { rows })
+}
+
+/// Whether a failed row means the registered path no longer exists.
+/// WSL rows rely on the helper's `PathNotFound` code; native rows check the
+/// filesystem directly.
+fn row_not_found(distro: Option<&str>, path: &Path, message: &str) -> bool {
+    if distro.is_some() || crate::wsl::is_wsl_path(path) {
+        message.starts_with("[PathNotFound]")
+    } else {
+        matches!(path.try_exists(), Ok(false))
+    }
 }
 
 pub async fn list_repositories_inner() -> Result<ListRepositoriesResponse, CommandError> {
@@ -293,6 +337,7 @@ pub async fn scan_root_inner(
     Ok(found
         .into_iter()
         .map(|path| RepoEntryDto {
+            worktree_of: None,
             name: None,
             path: displayable_path(&path),
             fetch: None,
@@ -347,6 +392,7 @@ async fn scan_root_wsl_inner(
     Ok(paths
         .into_iter()
         .map(|path| RepoEntryDto {
+            worktree_of: None,
             name: None,
             path: path.to_string_lossy().into_owned(),
             fetch: None,
@@ -533,13 +579,13 @@ fn validate_for_save(dto: &AppConfigDto) -> Result<(), CommandError> {
                 message: format!("repositories[{i}].path must be absolute: {}", repo.path),
             });
         }
-        if !is_wsl_entry && !p.is_dir() {
+        // Missing repository paths are allowed: they are shown as "Not found"
+        // and only the user removes them (never automatically). An existing
+        // path must still be a directory.
+        if !is_wsl_entry && p.exists() && !p.is_dir() {
             return Err(CommandError {
                 kind: "validation".into(),
-                message: format!(
-                    "repositories[{i}].path does not exist or is not a directory: {}",
-                    repo.path
-                ),
+                message: format!("repositories[{i}].path is not a directory: {}", repo.path),
             });
         }
         let key = DistroPathKey::current_host(normalized_distro.as_deref(), p);
@@ -812,6 +858,260 @@ pub async fn save_column_widths_inner_to_path(
     Ok(AppConfigDto::from(config))
 }
 
+/// Event emitted after the backend changes `repositories` on disk (discovery
+/// or removal) so an open Settings dialog can merge instead of overwriting.
+pub const EVENT_CONFIG_REPOSITORIES_CHANGED: &str = "config://repositories-changed";
+
+fn load_config_at(path: &Path) -> Result<AppConfig, CommandError> {
+    match path.try_exists() {
+        Ok(true) => git_clawler_core::config::load_from(path).map_err(|e| CommandError {
+            kind: "config".into(),
+            message: e.to_string(),
+        }),
+        Ok(false) => Ok(AppConfig::default()),
+        Err(e) => Err(CommandError {
+            kind: "internal".into(),
+            message: e.to_string(),
+        }),
+    }
+}
+
+fn save_config_at(config: &AppConfig, path: &Path) -> Result<(), CommandError> {
+    git_clawler_core::config::save_to(config, path).map_err(|e| CommandError {
+        kind: "internal".into(),
+        message: e.to_string(),
+    })
+}
+
+/// Re-read the config file, apply discovery results and save when changed.
+/// The caller holds [`SaveConfigLock`]. Returns whether the file changed.
+pub fn apply_discovery_to_path(
+    path: &Path,
+    discovery: &git_clawler_core::discovery::Discovery,
+) -> Result<bool, CommandError> {
+    if discovery.is_empty() {
+        return Ok(false);
+    }
+    let mut config = load_config_at(path)?;
+    if !git_clawler_core::discovery::apply(&mut config, discovery) {
+        return Ok(false);
+    }
+    save_config_at(&config, path)?;
+    Ok(true)
+}
+
+/// Result of [`remove_repository_inner_to_path`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RemoveRepositoryResult {
+    /// `(scan root, pattern)` added so discovery does not re-add the entry.
+    pub excluded: Option<(String, String)>,
+}
+
+/// Remove one repository entry and, when an auto scan root would rediscover
+/// it, add an exclusion to that root. Files on disk are never touched.
+pub fn remove_repository_inner_to_path(
+    path: &Path,
+    repo_path: &str,
+    distro: Option<String>,
+) -> Result<RemoveRepositoryResult, CommandError> {
+    let mut config = load_config_at(path)?;
+    let distro = crate::wsl::normalize_distro(distro);
+    let target = DistroPathKey::current_host(distro.as_deref(), Path::new(repo_path));
+    let index = config
+        .repositories
+        .iter()
+        .position(|r| {
+            DistroPathKey::current_host(
+                crate::wsl::normalize_distro(r.distro.clone()).as_deref(),
+                &r.path,
+            ) == target
+        })
+        .ok_or_else(|| CommandError {
+            kind: "validation".into(),
+            message: format!("repository is not registered: {repo_path}"),
+        })?;
+    let removed = config.repositories.remove(index);
+    let excluded = git_clawler_core::discovery::record_exclusion(&mut config, &removed)
+        .map(|(root, pattern)| (root.to_string_lossy().into_owned(), pattern));
+    save_config_at(&config, path)?;
+    Ok(RemoveRepositoryResult { excluded })
+}
+
+/// Discovery results per scan root, plus keys of worktree entries Git no
+/// longer tracks.
+type DiscoveryParts = (
+    Vec<(Option<String>, Vec<git_clawler_core::discovery::Found>)>,
+    std::collections::HashSet<DistroPathKey>,
+);
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn is_wsl_location(distro: &Option<String>, path: &Path) -> bool {
+    crate::wsl::normalize_distro(distro.clone()).is_some() || crate::wsl::is_wsl_path(path)
+}
+
+/// Discovery for native roots (blocking): per-root results plus the keys of
+/// native worktree entries Git no longer tracks.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn discover_native_parts(config: &AppConfig) -> DiscoveryParts {
+    use git_clawler_core::discovery::{discover_root, worktree_gone};
+    let mut found = Vec::new();
+    for root in config
+        .scan_roots
+        .iter()
+        .filter(|r| r.auto && !is_wsl_location(&r.distro, &r.path))
+    {
+        match discover_root(root) {
+            Ok(items) => found.push((None, items)),
+            Err(e) => tracing::warn!(root = %root.path.display(), error = %e, "discovery failed"),
+        }
+    }
+    let gone = config
+        .repositories
+        .iter()
+        .filter(|r| !is_wsl_location(&r.distro, &r.path))
+        .filter(|r| {
+            r.worktree_of
+                .as_deref()
+                .is_some_and(|parent| worktree_gone(&r.path, parent))
+        })
+        .map(|r| DistroPathKey::current_host(None, &r.path))
+        .collect();
+    (found, gone)
+}
+
+/// Discovery for WSL roots and worktree entries through the helper.
+#[cfg(target_os = "windows")]
+async fn discover_wsl_parts(handle: &tauri::AppHandle, config: &AppConfig) -> DiscoveryParts {
+    use crate::wsl::BootstrapInput;
+    use std::collections::{BTreeMap, HashSet};
+    use tauri::Manager;
+    let registry = handle.state::<HelperRegistryState>().0.clone();
+    let resource = handle.state::<HelperResourcePath>().0.clone();
+    let executor_for = |distro: Option<String>| {
+        let registry = registry.clone();
+        let resource = resource.clone();
+        async move {
+            let helper = registry
+                .ensure(BootstrapInput {
+                    distro,
+                    resource_helper_path: resource,
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>(crate::wsl::WslExecutor::new(
+                crate::wsl::TokioWslCommandRunner,
+                helper,
+            ))
+        }
+    };
+
+    let mut found = Vec::new();
+    for root in config
+        .scan_roots
+        .iter()
+        .filter(|r| r.auto && is_wsl_location(&r.distro, &r.path))
+    {
+        let distro = crate::wsl::normalize_distro(root.distro.clone());
+        let result = match executor_for(distro.clone()).await {
+            Ok(executor) => executor
+                .discover(
+                    distro.as_deref(),
+                    &root.path,
+                    root.depth,
+                    &root.exclude,
+                    root.worktrees,
+                )
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(items) => found.push((distro, items)),
+            Err(e) => {
+                tracing::warn!(root = %root.path.display(), error = %e, "WSL discovery failed")
+            }
+        }
+    }
+
+    let mut pairs: BTreeMap<Option<String>, Vec<(PathBuf, PathBuf)>> = BTreeMap::new();
+    for entry in config
+        .repositories
+        .iter()
+        .filter(|r| is_wsl_location(&r.distro, &r.path))
+    {
+        if let Some(parent) = &entry.worktree_of {
+            pairs
+                .entry(crate::wsl::normalize_distro(entry.distro.clone()))
+                .or_default()
+                .push((entry.path.clone(), parent.clone()));
+        }
+    }
+    let mut gone = HashSet::new();
+    for (distro, pairs) in pairs {
+        let result = match executor_for(distro.clone()).await {
+            Ok(executor) => executor
+                .worktrees_gone(distro.as_deref(), &pairs)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(paths) => gone.extend(
+                paths
+                    .iter()
+                    .map(|p| DistroPathKey::current_host(distro.as_deref(), p)),
+            ),
+            Err(e) => tracing::warn!(error = %e, "WSL worktree check failed"),
+        }
+    }
+    (found, gone)
+}
+
+/// Discovery for native and WSL roots followed by a locked
+/// re-read/apply/save of the config.
+#[cfg(target_os = "windows")]
+pub async fn run_discovery(handle: &tauri::AppHandle, config: AppConfig) {
+    use tauri::{Emitter, Manager};
+    let native_config = config.clone();
+    let (mut found, mut gone) =
+        match tokio::task::spawn_blocking(move || discover_native_parts(&native_config)).await {
+            Ok(parts) => parts,
+            Err(e) => {
+                tracing::warn!(error = %e, "discovery task failed");
+                return;
+            }
+        };
+    let (wsl_found, wsl_gone) = discover_wsl_parts(handle, &config).await;
+    found.extend(wsl_found);
+    gone.extend(wsl_gone);
+    let discovery = git_clawler_core::discovery::plan(&config, &found, |entry| {
+        gone.contains(&DistroPathKey::current_host(
+            crate::wsl::normalize_distro(entry.distro.clone()).as_deref(),
+            &entry.path,
+        ))
+    });
+    if discovery.is_empty() {
+        return;
+    }
+    let Ok(path) = git_clawler_core::config::default_config_path() else {
+        return;
+    };
+    let lock = handle.state::<SaveConfigLock>();
+    let _guard = lock.0.lock().await;
+    match apply_discovery_to_path(&path, &discovery) {
+        Ok(true) => {
+            tracing::info!(
+                added = discovery.add.len(),
+                pruned = discovery.prune.len(),
+                "scan-root discovery updated repositories"
+            );
+            let _ = handle.emit(EVENT_CONFIG_REPOSITORIES_CHANGED, ());
+        }
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %e.message, "failed to save discovery results"),
+    }
+}
+
 pub async fn save_column_widths_inner(
     column_widths: BTreeMap<String, u32>,
 ) -> Result<AppConfigDto, CommandError> {
@@ -1020,6 +1320,28 @@ pub async fn save_column_widths(
     save_column_widths_inner(column_widths).await
 }
 
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub async fn remove_repository(
+    path: String,
+    distro: Option<String>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SaveConfigLock>,
+) -> Result<RemoveRepositoryResult, CommandError> {
+    use tauri::Emitter;
+    let result = {
+        let _guard = state.0.lock().await;
+        let config_path =
+            git_clawler_core::config::default_config_path().map_err(|e| CommandError {
+                kind: "config".into(),
+                message: e.to_string(),
+            })?;
+        remove_repository_inner_to_path(&config_path, &path, distro)?
+    };
+    let _ = app.emit(EVENT_CONFIG_REPOSITORIES_CHANGED, ());
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1043,12 +1365,14 @@ mod tests {
         let config = AppConfig {
             repositories: vec![
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("first".into()),
                     path: PathBuf::from("/home/a"),
                     fetch: None,
                     distro: Some("Alpine".into()),
                 },
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("second".into()),
                     path: PathBuf::from("/home/b"),
                     fetch: None,
@@ -1073,6 +1397,7 @@ mod tests {
 
         let config = AppConfig {
             repositories: vec![RepoEntry {
+                worktree_of: None,
                 name: Some("test-repo".into()),
                 path: dir.path().to_path_buf(),
                 fetch: None,
@@ -1091,10 +1416,14 @@ mod tests {
 
     #[tokio::test]
     async fn err_row_for_nonexistent_path() {
+        // A native absolute path on every platform (on Windows, `/...` paths
+        // are WSL paths and are classified by the helper instead).
+        let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
             repositories: vec![RepoEntry {
+                worktree_of: None,
                 name: Some("missing".into()),
-                path: PathBuf::from("/nonexistent/path/that/does/not/exist"),
+                path: dir.path().join("does-not-exist"),
                 fetch: None,
                 distro: None,
             }],
@@ -1105,7 +1434,121 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.rows.len(), 1);
-        assert!(matches!(result.rows[0].status, RowStatus::Err(_)));
+        assert!(matches!(result.rows[0].status, RowStatus::NotFound(_)));
+    }
+
+    #[test]
+    fn wsl_rows_are_not_found_only_on_helper_path_not_found() {
+        let p = Path::new("/home/u/repo");
+        assert!(row_not_found(
+            Some("Ubuntu"),
+            p,
+            "[PathNotFound] path not found: /home/u/repo"
+        ));
+        assert!(!row_not_found(Some("Ubuntu"), p, "[Io] wsl.exe failed"));
+        assert!(!row_not_found(Some("Ubuntu"), p, "helper bootstrap failed"));
+    }
+
+    #[tokio::test]
+    async fn rows_carry_configured_worktree_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone-worktree");
+        let config = AppConfig {
+            repositories: vec![RepoEntry {
+                worktree_of: Some(dir.path().join("main")),
+                name: None,
+                path: missing,
+                fetch: None,
+                distro: None,
+            }],
+            ..Default::default()
+        };
+        let result = list_repositories_inner_with_config(config, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.rows[0].worktree_of.as_deref(),
+            Some(dir.path().join("main").to_string_lossy().as_ref())
+        );
+    }
+
+    fn scan_root_entry(path: &Path) -> git_clawler_core::config::ScanRootEntry {
+        git_clawler_core::config::ScanRootEntry {
+            path: path.to_path_buf(),
+            depth: 1,
+            exclude: Vec::new(),
+            distro: None,
+            auto: true,
+            worktrees: true,
+        }
+    }
+
+    #[test]
+    fn remove_repository_records_exclusion_for_auto_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let root = dir.path().join("projects");
+        let repo = root.join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        let config = AppConfig {
+            repositories: vec![RepoEntry {
+                worktree_of: None,
+                name: None,
+                path: repo.clone(),
+                fetch: None,
+                distro: None,
+            }],
+            scan_roots: vec![scan_root_entry(&root)],
+            ..Default::default()
+        };
+        git_clawler_core::config::save_to(&config, &config_path).unwrap();
+
+        let result =
+            remove_repository_inner_to_path(&config_path, &repo.to_string_lossy(), None).unwrap();
+        assert_eq!(result.excluded.unwrap().1, "app");
+        let saved = git_clawler_core::config::load_from(&config_path).unwrap();
+        assert!(saved.repositories.is_empty());
+        assert_eq!(saved.scan_roots[0].exclude, vec!["app"]);
+        assert!(repo.is_dir(), "files on disk are untouched");
+
+        let err = remove_repository_inner_to_path(&config_path, &repo.to_string_lossy(), None)
+            .unwrap_err();
+        assert_eq!(err.kind, "validation");
+    }
+
+    #[test]
+    fn apply_discovery_rereads_file_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let existing = dir.path().join("existing");
+        let added = dir.path().join("added");
+        let on_disk = AppConfig {
+            repositories: vec![RepoEntry {
+                worktree_of: None,
+                name: Some("kept".into()),
+                path: existing.clone(),
+                fetch: None,
+                distro: None,
+            }],
+            ..Default::default()
+        };
+        git_clawler_core::config::save_to(&on_disk, &config_path).unwrap();
+        let discovery = git_clawler_core::discovery::Discovery {
+            add: vec![RepoEntry {
+                worktree_of: None,
+                name: None,
+                path: added.clone(),
+                fetch: None,
+                distro: None,
+            }],
+            ..Default::default()
+        };
+        assert!(apply_discovery_to_path(&config_path, &discovery).unwrap());
+        assert!(!apply_discovery_to_path(&config_path, &discovery).unwrap());
+        let saved = git_clawler_core::config::load_from(&config_path).unwrap();
+        assert_eq!(saved.repositories.len(), 2);
+        assert_eq!(saved.repositories[0].name.as_deref(), Some("kept"));
+        assert_eq!(saved.repositories[1].path, added);
     }
 
     #[test]
@@ -1146,6 +1589,7 @@ mod tests {
 
         let config = AppConfig {
             repositories: vec![RepoEntry {
+                worktree_of: None,
                 name: Some("wsl-repo".into()),
                 path: PathBuf::from("/home/me/proj"),
                 fetch: None,
@@ -1186,18 +1630,21 @@ mod tests {
         let config = AppConfig {
             repositories: vec![
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("ubuntu-1".into()),
                     path: PathBuf::from("/home/me/a"),
                     fetch: None,
                     distro: Some("Ubuntu".into()),
                 },
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("ubuntu-2".into()),
                     path: PathBuf::from("/home/me/b"),
                     fetch: None,
                     distro: Some("Ubuntu".into()),
                 },
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("debian-1".into()),
                     path: PathBuf::from("/srv/c"),
                     fetch: None,
@@ -1268,6 +1715,7 @@ mod tests {
 
         let config = AppConfig {
             repositories: vec![RepoEntry {
+                worktree_of: None,
                 name: Some("wsl-repo".into()),
                 path: PathBuf::from("/home/me/proj"),
                 fetch: None,
@@ -1505,6 +1953,8 @@ mod settings_tests {
         let path = dir.path().join("config.toml");
         let mut dto = minimal_dto();
         dto.scan_roots.push(ScanRootEntryDto {
+            auto: true,
+            worktrees: true,
             path: dir.path().to_string_lossy().into_owned(),
             depth: 33,
             exclude: vec![],
@@ -1520,6 +1970,7 @@ mod settings_tests {
         let path = dir.path().join("config.toml");
         let mut dto = minimal_dto();
         dto.repositories.push(RepoEntryDto {
+            worktree_of: None,
             name: None,
             path: "relative/path".into(),
             fetch: None,
@@ -1530,19 +1981,20 @@ mod settings_tests {
     }
 
     #[tokio::test]
-    async fn validate_rejects_nonexistent_repo_path() {
+    async fn validate_allows_missing_repo_path() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut dto = minimal_dto();
         let missing = dir.path().join("missing-native-repo");
         dto.repositories.push(RepoEntryDto {
+            worktree_of: None,
             name: None,
             path: missing.to_string_lossy().into_owned(),
             fetch: None,
             distro: None,
         });
-        let err = save_config_inner_to_path(&path, dto).await.unwrap_err();
-        assert_eq!(err.kind, "validation");
+        // Missing repositories stay registered (shown as Not found).
+        save_config_inner_to_path(&path, dto).await.unwrap();
     }
 
     #[tokio::test]
@@ -1552,12 +2004,14 @@ mod settings_tests {
         let repo_path = dir.path().to_string_lossy().into_owned();
         let mut dto = minimal_dto();
         dto.repositories.push(RepoEntryDto {
+            worktree_of: None,
             name: None,
             path: repo_path.clone(),
             fetch: None,
             distro: None,
         });
         dto.repositories.push(RepoEntryDto {
+            worktree_of: None,
             name: None,
             path: repo_path,
             fetch: None,
@@ -1620,6 +2074,7 @@ mod settings_tests {
         let repo_path = dir.path().to_path_buf();
         let config = AppConfig {
             repositories: vec![RepoEntry {
+                worktree_of: None,
                 name: Some("test".into()),
                 path: repo_path.clone(),
                 fetch: None,
@@ -1641,6 +2096,7 @@ mod settings_tests {
         let path = dir.path().join("config.toml");
         let mut dto = minimal_dto();
         dto.repositories.push(RepoEntryDto {
+            worktree_of: None,
             name: None,
             path: file_path.to_string_lossy().into_owned(),
             fetch: None,
@@ -1657,6 +2113,8 @@ mod settings_tests {
         let mut dto = minimal_dto();
         let missing_path = dir.path().join("missing-scan-root");
         dto.scan_roots.push(ScanRootEntryDto {
+            auto: true,
+            worktrees: true,
             path: missing_path.to_string_lossy().into_owned(),
             depth: 1,
             exclude: vec![],
@@ -1674,6 +2132,8 @@ mod settings_tests {
         let path = dir.path().join("config.toml");
         let mut dto = minimal_dto();
         dto.scan_roots.push(ScanRootEntryDto {
+            auto: true,
+            worktrees: true,
             path: file_path.to_string_lossy().into_owned(),
             depth: 1,
             exclude: vec![],
@@ -1689,6 +2149,8 @@ mod settings_tests {
         let path = dir.path().join("config.toml");
         let mut dto = minimal_dto();
         dto.scan_roots.push(ScanRootEntryDto {
+            auto: true,
+            worktrees: true,
             path: "/home/example/projects".into(),
             depth: 3,
             exclude: vec![],
@@ -1705,6 +2167,8 @@ mod settings_tests {
         let path = dir.path().join("config.toml");
         let mut dto = minimal_dto();
         dto.scan_roots.push(ScanRootEntryDto {
+            auto: true,
+            worktrees: true,
             path: "C:\\workspace".into(),
             depth: 3,
             exclude: vec![],
@@ -1722,12 +2186,16 @@ mod settings_tests {
         let scan_path = dir.path().to_string_lossy().into_owned();
         let mut dto = minimal_dto();
         dto.scan_roots.push(ScanRootEntryDto {
+            auto: true,
+            worktrees: true,
             path: scan_path.clone(),
             depth: 1,
             exclude: vec![],
             distro: None,
         });
         dto.scan_roots.push(ScanRootEntryDto {
+            auto: true,
+            worktrees: true,
             path: scan_path,
             depth: 2,
             exclude: vec![],
@@ -1860,6 +2328,7 @@ mod settings_tests {
 
     fn wsl_repo(path: &str) -> RepoEntryDto {
         RepoEntryDto {
+            worktree_of: None,
             name: None,
             path: path.into(),
             fetch: None,

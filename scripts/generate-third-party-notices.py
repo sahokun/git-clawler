@@ -46,5 +46,8 @@ for name, entry in sorted(lock["packages"].items()):
     sections.append(f"\n===== npm: {name} {entry.get('version')} =====\nLicense: {entry.get('license')}\n" + "\n".join(texts))
     if not texts:
         missing.append("npm: " + name)
-(root / "THIRD_PARTY_NOTICES.txt").write_text("\n".join(sections))
+# Match the committed format (.editorconfig trims trailing whitespace) so a
+# regeneration only changes sections whose packages actually changed.
+text = "\n".join(line.rstrip(" \t") for line in "\n".join(sections).splitlines()) + "\n"
+(root / "THIRD_PARTY_NOTICES.txt").write_text(text)
 print("License texts requiring manual verification:", *missing, sep="\n", file=sys.stderr)

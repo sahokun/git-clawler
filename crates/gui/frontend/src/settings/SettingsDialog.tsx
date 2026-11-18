@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { getConfig } from '@/api'
+import { getConfig, subscribeConfigRepositoriesChanged } from '@/api'
+import { mergeExternalRepositories } from './externalMerge'
 import type { AppConfigDto, CommandError } from '@/types'
 import {
   Dialog,
@@ -35,6 +36,7 @@ export function SettingsDialog({ open, onOpenChange, onConfigChange }: Props) {
   const [loading, setLoading] = useState(false)
   const [immediate, setImmediate] = useState(false)
   const draftRef = useRef<AppConfigDto | null>(null)
+  const diskRef = useRef<AppConfigDto | null>(null)
 
   const resetDraft = () => {
     draftRef.current = null
@@ -70,6 +72,7 @@ export function SettingsDialog({ open, onOpenChange, onConfigChange }: Props) {
       getConfig()
         .then(cfg => {
           if (!cancelled) {
+            diskRef.current = cfg
             draftRef.current = cfg
             setDraft(cfg)
             onConfigChange?.(cfg)
@@ -88,6 +91,33 @@ export function SettingsDialog({ open, onOpenChange, onConfigChange }: Props) {
     }
     return () => {
       cancelled = true
+    }
+  }, [onConfigChange, open])
+
+  // Backend changes to repositories (discovery, removal) are merged into the
+  // open draft so the next autosave does not overwrite them with stale data.
+  useEffect(() => {
+    if (!open) return
+    let disposed = false
+    const unlisten = subscribeConfigRepositoriesChanged(() => {
+      getConfig()
+        .then(disk => {
+          if (disposed) return
+          const previous = diskRef.current
+          diskRef.current = disk
+          const current = draftRef.current
+          if (current == null) return
+          const merged = mergeExternalRepositories(current, previous, disk)
+          draftRef.current = merged
+          setImmediate(false)
+          setDraft(merged)
+          onConfigChange?.(merged)
+        })
+        .catch(() => {})
+    })
+    return () => {
+      disposed = true
+      void unlisten.then(fn => fn())
     }
   }, [onConfigChange, open])
 

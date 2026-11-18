@@ -70,7 +70,8 @@ impl Registry {
                 .unwrap_or_else(|| derive_name_from_path(&entry.path));
             let repo = Repository::new(name, &entry.path)
                 .with_fetch(entry.fetch)
-                .with_distro(entry.distro.clone());
+                .with_distro(entry.distro.clone())
+                .with_worktree_of(entry.worktree_of.clone());
             if let Err(e) = reg.add(repo) {
                 match &e {
                     RegistryError::AlreadyExists(_) => {
@@ -276,6 +277,7 @@ impl Registry {
                 path: r.path.clone(),
                 fetch: r.fetch,
                 distro: r.distro.clone(),
+                worktree_of: r.worktree_of.clone(),
             })
             .collect()
     }
@@ -444,12 +446,14 @@ mod tests {
         let config = AppConfig {
             repositories: vec![
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("explicit".into()),
                     path: PathBuf::from("/tmp/explicit"),
                     fetch: None,
                     distro: None,
                 },
                 RepoEntry {
+                    worktree_of: None,
                     name: None,
                     path: PathBuf::from("/tmp/auto-name"),
                     fetch: None,
@@ -469,12 +473,14 @@ mod tests {
         let config = AppConfig {
             repositories: vec![
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("first".into()),
                     path: PathBuf::from("/tmp/dup"),
                     fetch: None,
                     distro: None,
                 },
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("second".into()),
                     path: PathBuf::from("/tmp/dup"),
                     fetch: None,
@@ -511,18 +517,21 @@ mod tests {
         let config = AppConfig {
             repositories: vec![
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("with-fetch-true".into()),
                     path: PathBuf::from("/tmp/a"),
                     fetch: Some(true),
                     distro: None,
                 },
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("with-fetch-false".into()),
                     path: PathBuf::from("/tmp/b"),
                     fetch: Some(false),
                     distro: None,
                 },
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("inherit".into()),
                     path: PathBuf::from("/tmp/c"),
                     fetch: None,
@@ -545,18 +554,21 @@ mod tests {
         let config = AppConfig {
             repositories: vec![
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("keep-true".into()),
                     path: PathBuf::from("/tmp/keep-true"),
                     fetch: Some(true),
                     distro: None,
                 },
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("keep-false".into()),
                     path: PathBuf::from("/tmp/keep-false"),
                     fetch: Some(false),
                     distro: None,
                 },
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("keep-inherit".into()),
                     path: PathBuf::from("/tmp/keep-inherit"),
                     fetch: None,

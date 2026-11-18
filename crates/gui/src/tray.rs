@@ -40,14 +40,14 @@ pub fn derive_tray_status(rows: &[RepoRow]) -> TrayStatus {
 
     let any_unpushed = non_err.iter().any(|r| match &r.status {
         RowStatus::Ok(s) => !s.unpushed_branches.is_empty(),
-        RowStatus::Err(_) => false,
+        RowStatus::Err(_) | RowStatus::NotFound(_) => false,
     });
     if any_unpushed {
         return TrayStatus::Red;
     }
     let any_uncommitted = non_err.iter().any(|r| match &r.status {
         RowStatus::Ok(s) => s.uncommitted_files > 0,
-        RowStatus::Err(_) => false,
+        RowStatus::Err(_) | RowStatus::NotFound(_) => false,
     });
     if any_uncommitted {
         TrayStatus::Yellow
@@ -64,7 +64,7 @@ pub fn format_tooltip(rows: &[RepoRow]) -> String {
     let mut err_count = 0usize;
     for r in rows {
         match &r.status {
-            RowStatus::Err(_) => err_count += 1,
+            RowStatus::Err(_) | RowStatus::NotFound(_) => err_count += 1,
             RowStatus::Ok(s) => {
                 let has_unpushed = !s.unpushed_branches.is_empty();
                 if s.uncommitted_files > 0 {
@@ -96,17 +96,55 @@ pub const MENU_ID_EXIT: &str = "exit";
 pub const EVENT_SETTINGS_OPEN: &str = "settings://open";
 pub const EVENT_REFRESH_REQUESTED: &str = "refresh://requested";
 
-fn tray_icon_bytes_for_status(status: TrayStatus) -> &'static [u8] {
+// Reuse the application artwork, so tray branding cannot drift to old assets.
+const TRAY_ICON: &[u8] = include_bytes!("../icons/32x32.png");
+
+/// Brightest accent channel in the application artwork (teal ~ `#5ACFC6`).
+const ACCENT_REFERENCE: u16 = 209;
+
+/// Accent colour painted for each tray state, at full brightness.
+fn status_rgb(status: TrayStatus) -> [u8; 3] {
     match status {
-        TrayStatus::Green => include_bytes!("../resources/tray/green.png"),
-        TrayStatus::Yellow => include_bytes!("../resources/tray/yellow.png"),
-        TrayStatus::Red => include_bytes!("../resources/tray/red.png"),
+        TrayStatus::Green => [46, 204, 113],
+        TrayStatus::Yellow => [241, 196, 15],
+        TrayStatus::Red => [231, 76, 60],
+    }
+}
+
+/// The artwork's accent is teal: green and blue both clearly exceed red.
+/// The dark background, white glyph and orange node do not match.
+fn is_accent(r: u8, g: u8, b: u8) -> bool {
+    let (r, g, b) = (u16::from(r), u16::from(g), u16::from(b));
+    g > r + 24 && b > r + 24 && g.max(b) >= 64
+}
+
+fn apply_status_colour(rgba: &mut [u8], status: TrayStatus) {
+    let target = status_rgb(status);
+    for pixel in rgba.chunks_exact_mut(4) {
+        let [r, g, b] = [pixel[0], pixel[1], pixel[2]];
+        // Only recolour the accent; retain the glyph, outline and alpha.
+        if !is_accent(r, g, b) {
+            continue;
+        }
+        // Scale by the pixel's brightness so anti-aliased edges stay smooth.
+        let level = u16::from(g.max(b));
+        for (channel, &full) in pixel[..3].iter_mut().zip(&target) {
+            let scaled = u16::from(full) * level / ACCENT_REFERENCE;
+            *channel = u8::try_from(scaled.min(255)).unwrap_or(u8::MAX);
+        }
     }
 }
 
 #[cfg(target_os = "windows")]
-fn icon_bytes_for_status(status: TrayStatus) -> &'static [u8] {
-    tray_icon_bytes_for_status(status)
+fn icon_for_status(status: TrayStatus) -> tauri::Result<tauri::image::Image<'static>> {
+    let image = tauri::image::Image::from_bytes(TRAY_ICON)?;
+    let mut rgba = image.rgba().to_vec();
+    apply_status_colour(&mut rgba, status);
+    Ok(tauri::image::Image::new_owned(
+        rgba,
+        image.width(),
+        image.height(),
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -123,7 +161,7 @@ pub fn build_tray(app: &tauri::AppHandle, initial_status: TrayStatus) -> tauri::
 
     let menu = Menu::with_items(app, &[&open, &refresh, &sep1, &settings, &sep2, &exit])?;
 
-    let icon = tauri::image::Image::from_bytes(icon_bytes_for_status(initial_status))?;
+    let icon = icon_for_status(initial_status)?;
 
     let app_handle = app.clone();
     TrayIconBuilder::with_id("main-tray")
@@ -148,7 +186,7 @@ pub fn build_tray(app: &tauri::AppHandle, initial_status: TrayStatus) -> tauri::
 #[cfg(target_os = "windows")]
 pub fn refresh_status(app: &tauri::AppHandle, status: TrayStatus, tooltip: String) {
     if let Some(tray) = app.tray_by_id("main-tray") {
-        match tauri::image::Image::from_bytes(icon_bytes_for_status(status)) {
+        match icon_for_status(status) {
             Ok(icon) => {
                 if let Err(e) = tray.set_icon(Some(icon)) {
                     tracing::warn!(error=%e, "tray set_icon failed");
@@ -212,92 +250,84 @@ mod tests {
     use super::*;
     use crate::dto::{RepoStatusDto, UnpushedBranchDto};
 
-    // -----------------------------------------------------------------------
-    // Tray icon asset regression tests
-    //
-    // These tests guard against the tray PNG assets being accidentally
-    // reverted to the original single-color placeholder files (99-100 bytes).
-    // They run on all platforms because `include_bytes!` embeds the asset at
-    // compile time and the PNG header check is pure-Rust with no OS dependency.
-    // -----------------------------------------------------------------------
-
-    /// PNG magic bytes: \x89PNG\r\n\x1a\n
-    const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
-
-    /// Minimum acceptable size for a non-placeholder tray icon (bytes).
-    /// The original placeholder files were 99-100 bytes; the replacement icons
-    /// are ~770+ bytes. 300 bytes is a conservative lower bound.
-    const PNG_MIN_SIZE: usize = 300;
-
-    const PNG_IHDR_DATA_LEN: u32 = 13;
-    const PNG_FULL_IHDR_END: usize = 33;
-
-    fn tray_icon_assets() -> [(&'static str, &'static [u8]); 3] {
-        [
-            ("green", tray_icon_bytes_for_status(TrayStatus::Green)),
-            ("yellow", tray_icon_bytes_for_status(TrayStatus::Yellow)),
-            ("red", tray_icon_bytes_for_status(TrayStatus::Red)),
-        ]
-    }
-
-    fn assert_tray_icon_png(name: &str, bytes: &[u8]) {
-        assert!(
-            bytes.len() >= PNG_FULL_IHDR_END,
-            "{name}.png too small to contain full IHDR chunk"
-        );
-        assert_eq!(
-            &bytes[..8],
-            PNG_MAGIC,
-            "{name}.png does not start with PNG magic bytes"
-        );
-        let ihdr_len = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        assert_eq!(
-            ihdr_len, PNG_IHDR_DATA_LEN,
-            "{name}.png IHDR length is {ihdr_len}, expected {PNG_IHDR_DATA_LEN}"
-        );
-        assert_eq!(
-            &bytes[12..16],
-            b"IHDR",
-            "{name}.png first chunk is not IHDR"
-        );
-
-        let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-        let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
-        let bit_depth = bytes[24];
-        let color_type = bytes[25];
-
-        assert_eq!(w, 32, "{name}.png width is {w}, expected 32");
-        assert_eq!(h, 32, "{name}.png height is {h}, expected 32");
-        assert_eq!(
-            bit_depth, 8,
-            "{name}.png bit depth is {bit_depth}, expected 8"
-        );
-        assert_eq!(
-            color_type, 6,
-            "{name}.png color type is {color_type}, expected 6 (RGBA)"
-        );
-        assert!(
-            bytes.len() >= PNG_MIN_SIZE,
-            "{name}.png is only {} bytes — looks like a placeholder (min {})",
-            bytes.len(),
-            PNG_MIN_SIZE
-        );
-    }
-
     #[test]
-    fn tray_icons_are_valid_pngs_and_not_placeholders() {
-        for (name, bytes) in tray_icon_assets() {
-            assert_tray_icon_png(name, bytes);
+    fn status_colour_preserves_glyph_and_transparency() {
+        // Accent at reference brightness, white glyph, transparent background,
+        // orange node.
+        let original = [
+            90, 209, 198, 128, 240, 240, 240, 255, 20, 20, 20, 0, 221, 153, 44, 254,
+        ];
+        for status in [TrayStatus::Green, TrayStatus::Yellow, TrayStatus::Red] {
+            let mut pixels = original;
+            apply_status_colour(&mut pixels, status);
+            assert_eq!(&pixels[..3], &status_rgb(status), "{status:?}");
+            assert_eq!(pixels[3], 128, "{status:?} alpha");
+            assert_eq!(&pixels[4..], &original[4..], "{status:?}");
         }
     }
 
-    /// The three icon assets must be distinct (different status colours).
     #[test]
-    fn tray_icons_are_distinct() {
-        let [(_, green), (_, yellow), (_, red)] = tray_icon_assets();
-        assert_ne!(green, yellow, "green and yellow tray icons are identical");
-        assert_ne!(yellow, red, "yellow and red tray icons are identical");
-        assert_ne!(green, red, "green and red tray icons are identical");
+    fn status_colour_scales_dim_accent_pixels() {
+        let mut pixels = [43, 81, 82, 200];
+        apply_status_colour(&mut pixels, TrayStatus::Red);
+        // 82 / 209 of the full red accent.
+        assert_eq!(pixels, [90, 29, 23, 200]);
+    }
+
+    /// Decode the real application artwork without Tauri, so this runs on
+    /// every platform and catches artwork whose accent no longer matches.
+    fn decode_artwork() -> Vec<u8> {
+        let decoder = png::Decoder::new(std::io::Cursor::new(TRAY_ICON));
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!((info.width, info.height), (32, 32));
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        buf.truncate(info.buffer_size());
+        buf
+    }
+
+    #[test]
+    fn application_artwork_has_distinct_status_colours() {
+        let original = decode_artwork();
+        let accent = original
+            .chunks_exact(4)
+            .filter(|p| p[3] > 0 && is_accent(p[0], p[1], p[2]))
+            .count();
+        assert!(accent >= 50, "only {accent} accent pixels found");
+
+        let render = |status| {
+            let mut rgba = original.clone();
+            apply_status_colour(&mut rgba, status);
+            rgba
+        };
+        let (green, yellow, red) = (
+            render(TrayStatus::Green),
+            render(TrayStatus::Yellow),
+            render(TrayStatus::Red),
+        );
+        assert_ne!(green, yellow);
+        assert_ne!(yellow, red);
+        assert_ne!(green, red);
+        for icon in [&green, &yellow, &red] {
+            for (a, b) in original.chunks_exact(4).zip(icon.chunks_exact(4)) {
+                assert_eq!(a[3], b[3]);
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn application_artwork_decodes_for_all_tray_states() {
+        let green = icon_for_status(TrayStatus::Green).unwrap();
+        assert_eq!((green.width(), green.height()), (32, 32));
+        let yellow = icon_for_status(TrayStatus::Yellow).unwrap();
+        let red = icon_for_status(TrayStatus::Red).unwrap();
+        assert_ne!(green.rgba(), yellow.rgba());
+        assert_ne!(yellow.rgba(), red.rgba());
+        for (a, b) in green.rgba().chunks_exact(4).zip(red.rgba().chunks_exact(4)) {
+            assert_eq!(a[3], b[3]);
+        }
     }
 
     fn ok_row(uncommitted: u32, unpushed: u32) -> RepoRow {
@@ -309,6 +339,7 @@ mod tests {
             })
             .collect();
         RepoRow {
+            worktree_of: None,
             index: 0,
             name: "x".into(),
             path: "/x".into(),
@@ -333,6 +364,7 @@ mod tests {
 
     fn err_row() -> RepoRow {
         RepoRow {
+            worktree_of: None,
             index: 0,
             name: "e".into(),
             path: "/e".into(),

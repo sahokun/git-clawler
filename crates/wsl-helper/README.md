@@ -14,14 +14,25 @@ git-clawler-wsl-helper /absolute/path/to/repo1 /absolute/path/to/repo2
 
 # Fetch before scanning to improve pull-conflict prediction accuracy
 git-clawler-wsl-helper --fetch /absolute/path/to/repo1 /absolute/path/to/repo2
+
+# Discover repositories (and their linked worktrees) below a scan root
+git-clawler-wsl-helper --discover /home/user/projects --depth 1 --exclude old/app [--no-worktrees]
+
+# Report which registered worktrees Git no longer tracks (pairs in order)
+git-clawler-wsl-helper --worktree-gone --worktree /tmp/app-wt --parent /home/user/projects/app
 ```
+
+`--scan-root`, `--discover` and `--worktree-gone` are mutually exclusive and cannot be
+combined with repository paths. A missing repository path is reported with error code
+`path_not_found` (distinct from `not_a_repository`), and a linked worktree's status
+includes `worktree_parent`.
 
 ## JSON Wire Format
 
 ### `--protocol` output
 
 ```json
-{"protocol_version":1,"helper_version":"1.0.0"}
+{"protocol_version":1,"helper_version":"1.1.0"}
 ```
 
 ### Scan output — ok
@@ -29,7 +40,7 @@ git-clawler-wsl-helper --fetch /absolute/path/to/repo1 /absolute/path/to/repo2
 ```json
 {
   "protocol_version": 1,
-  "helper_version": "1.0.0",
+  "helper_version": "1.1.0",
   "scanned_at": "2026-04-27T08:05:00Z",
   "results": [
     {
@@ -94,7 +105,7 @@ The output is a single JSON line that deserialises to the
 `HelperHandshake` DTO defined in `protocol.rs`:
 
 ```json
-{"protocol_version": 1, "helper_version": "1.0.0", "capabilities": {"populates_remote_url": true, "scans_roots": true, "populates_recent_commits": true}}
+{"protocol_version": 1, "helper_version": "1.1.0", "capabilities": {"populates_remote_url": true, "scans_roots": true, "populates_recent_commits": true, "discovers_roots": true, "reports_worktrees": true}}
 ```
 
 | Field | Type | Description |
@@ -122,6 +133,8 @@ required capability flag is `false`.
 | `populates_remote_url` | `false` | When `true`, each `RepoStatusDto.remote_url` is populated inside WSL via git2. The GUI uses this to run `gh api` enrichment on the Windows host without needing `gh` inside the WSL distro. Old helpers that predate this field default to `false`, triggering a forced reinstall. |
 | `scans_roots` | `false` | When `true`, the helper supports `--scan-root` repository discovery. |
 | `populates_recent_commits` | `false` | When `true`, each `RepoStatusDto.recent_commits` contains up to five newest `HEAD` commits. |
+| `discovers_roots` | `false` | When `true`, the helper supports `--discover` (repositories plus linked worktrees) and `--worktree-gone`. |
+| `reports_worktrees` | `false` | When `true`, `RepoStatusDto.worktree_parent` is populated for linked worktrees and missing paths use the `path_not_found` error code. |
 
 ## Exit Codes
 

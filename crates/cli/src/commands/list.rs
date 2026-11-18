@@ -15,13 +15,15 @@ pub async fn run(with_github: bool) -> anyhow::Result<()> {
     }
 
     let show_github = config.github.enabled || with_github;
-    let rows = if show_github {
+    let mut rows = if show_github {
         let mut github_cfg = config.github.clone();
         github_cfg.enabled = true;
         scan_all_with_github(targets, &github_cfg).await
     } else {
         scan_all(targets).await
     };
+
+    git_clawler_core::list::dedupe_worktree_branches(&mut rows);
 
     use std::io::IsTerminal;
     let color = std::io::stdout().is_terminal();

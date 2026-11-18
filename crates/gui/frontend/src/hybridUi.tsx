@@ -9,8 +9,10 @@ import {
   ExternalLink,
   FolderOpen,
   GitBranch,
+  GitFork,
   Monitor,
   Server,
+  Trash2,
   X,
 } from 'lucide-react'
 import type { RepoRow, RepoStatusDto } from './types'
@@ -47,6 +49,12 @@ export interface RepoViewModel {
   host: HostKind
   hostLabel: string
   state: 'clean' | 'dirty' | 'behind' | 'conflict' | 'error'
+  /** The registered path no longer exists (removal is up to the user). */
+  notFound: boolean
+  /** Main repository path when this row is a linked worktree. */
+  worktreeOf: string | null
+  /** Rendered under its main repository (set by {@link groupWorktrees}). */
+  nested?: boolean
   tone: StatusTone
   status: RepoStatusDto | null
   error: string | null
@@ -67,6 +75,7 @@ export interface RepoViewModel {
 
 export interface KpiTotals {
   repos: number
+  worktrees: number
   uncommitted: number
   push: number
   behind: number
@@ -226,7 +235,9 @@ export function toViewModel(row: RepoRow): RepoViewModel {
   const displayName = row.name || basename(row.path)
   const repository = row.is_current ? `* ${row.path}` : row.path
 
-  if (row.status.kind === 'err') {
+  const worktreeOf = row.worktree_of ?? null
+  if (row.status.kind !== 'ok') {
+    const notFound = row.status.kind === 'not_found'
     return {
       row,
       repository,
@@ -235,10 +246,12 @@ export function toViewModel(row: RepoRow): RepoViewModel {
       host,
       hostLabel: hostLabel(row, host),
       state: 'error',
+      notFound,
+      worktreeOf,
       tone: 'danger',
       status: null,
       error: row.status.value,
-      branch: 'ERROR',
+      branch: notFound ? 'NOT FOUND' : 'ERROR',
       uncommitted: 0,
       push: 0,
       ahead: 0,
@@ -250,7 +263,7 @@ export function toViewModel(row: RepoRow): RepoViewModel {
       lastScan: formatLastScan(row.scanned_at),
       remoteUrl: row.remote_url,
       githubUrl: githubUrlFromRemote(row.remote_url),
-      searchable: `${row.path} ${displayName} ${row.status.value} ${host}`.toLowerCase(),
+      searchable: `${row.path} ${displayName} ${row.status.value} ${host}${notFound ? ' not found' : ''}${worktreeOf ? ' worktree' : ''}`.toLowerCase(),
     }
   }
 
@@ -279,6 +292,8 @@ export function toViewModel(row: RepoRow): RepoViewModel {
     host,
     hostLabel: hostLabel(row, host),
     state,
+    notFound: false,
+    worktreeOf,
     tone,
     status,
     error: null,
@@ -319,14 +334,45 @@ export function matchesSearch(view: RepoViewModel, query: string): boolean {
 
 export function summarize(views: RepoViewModel[]): KpiTotals {
   return views.reduce<KpiTotals>((acc, view) => {
-    acc.repos += 1
+    if (view.worktreeOf) acc.worktrees += 1
+    else acc.repos += 1
     acc.uncommitted += view.uncommitted
     acc.push += view.push
     acc.behind += view.behind
     if (view.status?.conflict_predicted === true) acc.conflicts += 1
     if (view.error) acc.errors += 1
     return acc
-  }, { repos: 0, uncommitted: 0, push: 0, behind: 0, conflicts: 0, errors: 0 })
+  }, { repos: 0, worktrees: 0, uncommitted: 0, push: 0, behind: 0, conflicts: 0, errors: 0 })
+}
+
+function pathKey(path: string, distro: string | null): string {
+  const normalized = path.replace(/\\/g, '/').replace(/\/+$/, '')
+  const host = isWslRepoPath(path) ? normalized : normalized.toLowerCase()
+  return JSON.stringify([distro ?? null, host])
+}
+
+/**
+ * Order rows so each linked worktree follows its main repository (marked
+ * `nested`). Worktrees whose main repository is not in `views` stay in place.
+ */
+export function groupWorktrees(views: RepoViewModel[]): RepoViewModel[] {
+  const present = new Set(views.map(view => pathKey(view.row.path, view.row.distro)))
+  const children = new Map<string, RepoViewModel[]>()
+  for (const view of views) {
+    if (!view.worktreeOf) continue
+    const parent = pathKey(view.worktreeOf, view.row.distro)
+    if (!present.has(parent)) continue
+    children.set(parent, [...(children.get(parent) ?? []), view])
+  }
+  const out: RepoViewModel[] = []
+  for (const view of views) {
+    if (view.worktreeOf && present.has(pathKey(view.worktreeOf, view.row.distro))) continue
+    out.push({ ...view, nested: false })
+    for (const child of children.get(pathKey(view.row.path, view.row.distro)) ?? []) {
+      out.push({ ...child, nested: true })
+    }
+  }
+  return out
 }
 
 export function FieldTip({
@@ -473,7 +519,7 @@ export function RepoListRow({ view, selected, onSelect, gridTemplateColumns }: {
   return (
     <button
       type="button"
-      className={`gc-grid-row ${selected ? 'is-selected' : ''}`}
+      className={`gc-grid-row ${selected ? 'is-selected' : ''} ${view.nested ? 'is-worktree' : ''}`}
       data-state={view.state}
       onClick={onSelect}
       style={{ gridTemplateColumns }}
@@ -484,6 +530,11 @@ export function RepoListRow({ view, selected, onSelect, gridTemplateColumns }: {
           <span className="gc-host-icon"><HostIcon host={view.host} /></span>
           <span className={`gc-pip tone-${view.tone}`} />
           <span className="gc-repo-text">
+            {view.worktreeOf && (
+              <span className="gc-worktree-badge" title={`Linked worktree of ${view.worktreeOf}`}>
+                <GitFork className="h-3 w-3" /> worktree
+              </span>
+            )}
             <span className="gc-repo-name">{view.displayName}</span>
             <span className="gc-repo-path"> {view.parentPath}</span>
           </span>
@@ -547,11 +598,13 @@ export function DetailPanel({
   onClose,
   onOpenFolder,
   onOpenGithub,
+  onRemove,
 }: {
   view: RepoViewModel
   onClose: () => void
   onOpenFolder: (view: RepoViewModel) => void
   onOpenGithub: (view: RepoViewModel) => void
+  onRemove?: (view: RepoViewModel) => void
 }) {
   const recentCommits = view.status?.recent_commits ?? []
 
@@ -570,7 +623,7 @@ export function DetailPanel({
         {view.repository.replace(/^\*\s*/, '')}
       </FieldTip>
       <div className="gc-detail-actions" aria-label="Repository actions">
-        <Button variant="outline" size="sm" onClick={() => onOpenFolder(view)}>
+        <Button variant="outline" size="sm" onClick={() => onOpenFolder(view)} disabled={view.notFound}>
           <FolderOpen className="h-3.5 w-3.5" />
           {view.host === 'wsl' ? 'Open WSL folder' : 'Open in Explorer'}
         </Button>
@@ -578,11 +631,22 @@ export function DetailPanel({
           <ExternalLink className="h-3.5 w-3.5" />
           GitHub
         </Button>
+        {onRemove && (
+          <Button
+            variant={view.notFound ? 'destructive' : 'outline'}
+            size="sm"
+            onClick={() => onRemove(view)}
+            title="Remove from the list. Files on disk are not touched."
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            Remove
+          </Button>
+        )}
       </div>
 
       {view.error ? (
         <section className="gc-detail-error">
-          <h2><AlertTriangle className="h-4 w-4" /> Scan error</h2>
+          <h2><AlertTriangle className="h-4 w-4" /> {view.notFound ? 'Path not found' : 'Scan error'}</h2>
           <p>{view.error}</p>
         </section>
       ) : (

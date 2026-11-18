@@ -36,6 +36,7 @@ async-trait = "0.1.92"
 [dev-dependencies]
 git2        = { workspace = true }
 tempfile    = { workspace = true }
+png         = "0.18.1"
 tokio       = { workspace = true, features = ["test-util"] }
 
 # Windows-only: Tauri runtime
@@ -43,7 +44,7 @@ tokio       = { workspace = true, features = ["test-util"] }
 tauri = { workspace = true, features = ["tray-icon", "image-png"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
-tauri-plugin-notification = "2.3.3"
+tauri-plugin-notification = "2.8.0"
 
 # Windows-only: Tauri build helper (generates context at compile time)
 [target.'cfg(target_os = "windows")'.build-dependencies]

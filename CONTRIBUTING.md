@@ -32,7 +32,8 @@ cd crates/gui
 npm ci
 npm test
 npm run build
-npm audit
+cd ../..
+python3 scripts/audit-npm.py
 ```
 
 Run Rust checks on Linux and Windows for platform-specific changes. Add regression tests
@@ -48,6 +49,14 @@ versions, including transitive dependencies, must have been published for at lea
 days. Record dates and yanked/deprecated checks in the PR before validation. Audit both
 Rust and npm; review vendored libgit2/OpenSSL advisories separately. Advisory exceptions
 must identify a reason, affected targets, tracking issue and expiry; do not silently renew them.
+
+`python3 scripts/refresh-deps.py check` compares the lockfiles with `origin/main` and fails
+on versions younger than seven days, yanked/deprecated releases or Tauri Rust/JavaScript
+major.minor mismatches; `--markdown FILE` writes the publication table for the PR.
+`python3 scripts/refresh-deps.py fix` also pins too-new crates to the newest eligible
+release, regenerates `THIRD_PARTY_NOTICES.txt` and adds licence supplements for new crate
+versions from the previous supplement's sources. Review its notes; npm versions and
+Tauri mismatches are reported, not changed.
 
 Public documentation is canonical English; update the Japanese mirrors for substantial
 changes. Document CLI/TOML compatibility changes. Never include credentials, personal

@@ -7,8 +7,9 @@ import tomllib
 
 root = Path(__file__).resolve().parents[1]
 text = (root / "deny.toml").read_text()
-expiry = re.search(r"Review expires (\d{4}-\d{2}-\d{2})", text)
-if not expiry or date.today() > date.fromisoformat(expiry[1]):
+# Every exception group carries its own deadline; the earliest one governs.
+expiries = [date.fromisoformat(d) for d in re.findall(r"Review expires (\d{4}-\d{2}-\d{2})", text)]
+if not expiries or date.today() > min(expiries):
     raise SystemExit("Advisory exceptions require a new review before auditing")
 config = tomllib.loads(text)
 command = ["cargo", "audit", "--deny", "warnings"]

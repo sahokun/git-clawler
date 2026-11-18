@@ -32,6 +32,38 @@ pub enum ScanRootStatus {
     Err(HelperError),
 }
 
+/// Response to `--discover`: repositories and linked worktrees under a root.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoverResponse {
+    pub protocol_version: u32,
+    pub helper_version: String,
+    pub scanned_at: String,
+    pub root: String,
+    pub status: DiscoverStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum DiscoverStatus {
+    Ok(Vec<FoundDto>),
+    Err(HelperError),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FoundDto {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_of: Option<String>,
+}
+
+/// Response to `--worktree-gone`: registered worktrees Git no longer tracks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeGoneResponse {
+    pub protocol_version: u32,
+    pub helper_version: String,
+    pub gone: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Scan result for one input path.
 /// `index` preserves the original argument position.
@@ -75,6 +107,9 @@ pub struct RepoStatusDto {
     /// Newest HEAD commits, most recent first.
     #[serde(default)]
     pub recent_commits: Vec<RecentCommitDto>,
+    /// Main repository path when the scanned path is a linked worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_parent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +141,7 @@ pub struct HelperError {
 /// Stable machine-readable error code used by GUI-side handling.
 pub enum ErrorCode {
     RelativePath,
+    PathNotFound,
     NotARepository,
     BareRepository,
     OpenRepository,
@@ -134,6 +170,7 @@ impl From<RepoStatus> for RepoStatusDto {
                 .into_iter()
                 .map(RecentCommitDto::from)
                 .collect(),
+            worktree_parent: s.worktree_parent.map(|p| p.to_string_lossy().into_owned()),
         }
     }
 }
@@ -163,6 +200,7 @@ impl From<&StatusError> for HelperError {
     fn from(e: &StatusError) -> Self {
         let code = match e {
             StatusError::RelativePath(_) => ErrorCode::RelativePath,
+            StatusError::PathNotFound(_) => ErrorCode::PathNotFound,
             StatusError::NotARepository(_) => ErrorCode::NotARepository,
             StatusError::BareRepository(_) => ErrorCode::BareRepository,
             StatusError::OpenRepository { .. } => ErrorCode::OpenRepository,
@@ -223,6 +261,14 @@ pub struct HelperCapabilities {
     /// When `true`, the helper populates `RepoStatusDto.recent_commits`.
     #[serde(default)]
     pub populates_recent_commits: bool,
+    /// When `true`, the helper supports `--discover` (repositories plus linked
+    /// worktrees) and `--worktree-gone`.
+    #[serde(default)]
+    pub discovers_roots: bool,
+    /// When `true`, the helper reports `RepoStatusDto.worktree_parent` and the
+    /// `PathNotFound` error code.
+    #[serde(default)]
+    pub reports_worktrees: bool,
 }
 
 #[cfg(test)]
@@ -245,6 +291,8 @@ mod tests {
             protocol_version: crate::PROTOCOL_VERSION,
             helper_version: crate::HELPER_VERSION.to_string(),
             capabilities: HelperCapabilities {
+                discovers_roots: true,
+                reports_worktrees: true,
                 populates_remote_url: true,
                 scans_roots: true,
                 populates_recent_commits: true,
@@ -296,6 +344,8 @@ mod tests {
             protocol_version: 1,
             helper_version: "0.1.0".into(),
             capabilities: HelperCapabilities {
+                discovers_roots: true,
+                reports_worktrees: true,
                 populates_remote_url: true,
                 scans_roots: true,
                 populates_recent_commits: true,
@@ -319,6 +369,7 @@ mod tests {
     #[test]
     fn ok_status_json_shape() {
         let dto = RepoStatusDto {
+            worktree_parent: None,
             current_branch: Some("main".into()),
             uncommitted_files: 2,
             unpushed_branches: vec![],
@@ -350,6 +401,7 @@ mod tests {
     #[test]
     fn repo_status_dto_omits_github_key() {
         let dto = RepoStatusDto {
+            worktree_parent: None,
             current_branch: None,
             uncommitted_files: 0,
             unpushed_branches: vec![],
@@ -387,6 +439,7 @@ mod tests {
     #[test]
     fn remote_url_none_is_omitted_from_serialization() {
         let dto = RepoStatusDto {
+            worktree_parent: None,
             current_branch: None,
             uncommitted_files: 0,
             unpushed_branches: vec![],
@@ -408,6 +461,7 @@ mod tests {
     #[test]
     fn remote_url_some_is_included_in_serialization() {
         let dto = RepoStatusDto {
+            worktree_parent: None,
             current_branch: None,
             uncommitted_files: 0,
             unpushed_branches: vec![],

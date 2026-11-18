@@ -17,4 +17,4 @@ pub mod protocol;
 pub mod runner;
 
 pub use protocol::*;
-pub use runner::{run_scan, run_scan_root};
+pub use runner::{run_discover, run_scan, run_scan_root, run_worktree_gone};

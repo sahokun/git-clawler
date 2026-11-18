@@ -1,6 +1,6 @@
 use crate::protocol::{
-    ErrorCode, HelperError, PathResult, PathStatus, RepoStatusDto, ScanResponse, ScanRootResponse,
-    ScanRootStatus,
+    DiscoverResponse, DiscoverStatus, ErrorCode, FoundDto, HelperError, PathResult, PathStatus,
+    RepoStatusDto, ScanResponse, ScanRootResponse, ScanRootStatus, WorktreeGoneResponse,
 };
 use crate::{HELPER_VERSION, PROTOCOL_VERSION};
 use std::path::PathBuf;
@@ -132,6 +132,73 @@ pub async fn run_scan_root(root: PathBuf, depth: u32, exclude: Vec<String>) -> S
     }
 }
 
+/// Discover repositories and (optionally) their linked worktrees under a root.
+pub async fn run_discover(
+    root: PathBuf,
+    depth: u32,
+    exclude: Vec<String>,
+    worktrees: bool,
+) -> DiscoverResponse {
+    let root_str = root.to_string_lossy().into_owned();
+    let status = tokio::task::spawn_blocking(move || {
+        let entry = git_clawler_core::config::ScanRootEntry {
+            path: root,
+            depth,
+            exclude: exclude
+                .into_iter()
+                .filter(|v| !v.trim().is_empty())
+                .collect(),
+            distro: None,
+            auto: true,
+            worktrees,
+        };
+        git_clawler_core::discovery::discover_root(&entry)
+    })
+    .await;
+    let status = match status {
+        Ok(Ok(found)) => DiscoverStatus::Ok(
+            found
+                .into_iter()
+                .map(|f| FoundDto {
+                    path: f.path.to_string_lossy().into_owned(),
+                    worktree_of: f.worktree_of.map(|p| p.to_string_lossy().into_owned()),
+                })
+                .collect(),
+        ),
+        Ok(Err(e)) => DiscoverStatus::Err(scan_error_to_helper_error(&e)),
+        Err(join_err) => DiscoverStatus::Err(HelperError {
+            code: ErrorCode::Panic,
+            message: format!("task panicked: {join_err}"),
+        }),
+    };
+    DiscoverResponse {
+        protocol_version: PROTOCOL_VERSION,
+        helper_version: HELPER_VERSION.to_string(),
+        scanned_at: chrono::Utc::now().to_rfc3339(),
+        root: root_str,
+        status,
+    }
+}
+
+/// Of the `(worktree, main repository)` pairs, return the worktrees Git no
+/// longer tracks (see `git_clawler_core::discovery::worktree_gone`).
+pub async fn run_worktree_gone(pairs: Vec<(PathBuf, PathBuf)>) -> WorktreeGoneResponse {
+    let gone = tokio::task::spawn_blocking(move || {
+        pairs
+            .into_iter()
+            .filter(|(path, parent)| git_clawler_core::discovery::worktree_gone(path, parent))
+            .map(|(path, _)| path.to_string_lossy().into_owned())
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+    WorktreeGoneResponse {
+        protocol_version: PROTOCOL_VERSION,
+        helper_version: HELPER_VERSION.to_string(),
+        gone,
+    }
+}
+
 fn scan_error_to_helper_error(e: &git_clawler_core::scanner::ScanError) -> HelperError {
     let code = match e {
         git_clawler_core::scanner::ScanError::RootNotAbsolute(_) => ErrorCode::RelativePath,
@@ -168,15 +235,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonexistent_absolute_path_yields_not_a_repository() {
+    async fn nonexistent_absolute_path_yields_path_not_found() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist");
         // Drop tempdir so absolute path is gone; path remains absolute
         let resp = run_scan(vec![path], false).await;
         assert_eq!(resp.results.len(), 1);
         match &resp.results[0].status {
-            PathStatus::Err(e) => assert!(matches!(e.code, ErrorCode::NotARepository)),
-            other => panic!("expected Err(NotARepository), got {other:?}"),
+            PathStatus::Err(e) => assert!(matches!(e.code, ErrorCode::PathNotFound)),
+            other => panic!("expected Err(PathNotFound), got {other:?}"),
         }
     }
 
@@ -316,5 +383,58 @@ mod tests {
             }
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    fn init_repo(path: &std::path::Path) -> git2::Repository {
+        std::fs::create_dir_all(path).unwrap();
+        let repo = git2::Repository::init(path).unwrap();
+        std::fs::write(path.join("f"), "x").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("f")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = git2::Signature::now("t", "t@example.com").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+        }
+        repo
+    }
+
+    #[tokio::test]
+    async fn discover_reports_repositories_and_external_worktrees() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("projects");
+        let app = init_repo(&root.join("app"));
+        let ext = base.path().join("app-ext");
+        app.worktree("ext", &ext, None).unwrap();
+
+        let resp = run_discover(root.clone(), 1, Vec::new(), true).await;
+        let found = match resp.status {
+            DiscoverStatus::Ok(found) => found,
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        assert_eq!(found.len(), 2, "{found:?}");
+        let wt = found.iter().find(|f| f.worktree_of.is_some()).unwrap();
+        assert!(wt.path.ends_with("app-ext"));
+
+        let without = run_discover(root, 1, Vec::new(), false).await;
+        match without.status {
+            DiscoverStatus::Ok(found) => assert_eq!(found.len(), 1),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        let gone = run_worktree_gone(vec![(ext.clone(), base.path().join("projects/app"))]).await;
+        assert!(gone.gone.is_empty());
+        std::fs::remove_dir_all(&ext).unwrap();
+        let gone = run_worktree_gone(vec![(ext.clone(), base.path().join("projects/app"))]).await;
+        assert_eq!(gone.gone, vec![ext.to_string_lossy().into_owned()]);
+    }
+
+    #[tokio::test]
+    async fn discover_missing_root_is_an_error() {
+        let base = tempfile::tempdir().unwrap();
+        let resp = run_discover(base.path().join("missing"), 1, Vec::new(), true).await;
+        assert!(matches!(resp.status, DiscoverStatus::Err(_)));
     }
 }

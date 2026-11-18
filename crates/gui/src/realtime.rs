@@ -21,6 +21,45 @@ pub const EVENT_SHORTCUT_STATUS: &str = "shortcut://status";
 
 const ERROR_THROTTLE_TTL: Duration = Duration::from_secs(30);
 
+/// How often scan roots with `auto = true` are re-examined on poll ticks.
+/// Discovery also runs at startup, on manual refresh and when scan roots change.
+pub const DISCOVERY_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Fire-and-forget scan-root discovery. The hook persists any changes to the
+/// config file itself; the resulting `ConfigChanged` event triggers a rescan.
+pub type DiscoverHook =
+    std::sync::Arc<dyn Fn(AppConfig) -> BoxFuture<'static, ()> + Send + Sync + 'static>;
+
+/// What a processed watcher event asks of discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DiscoveryRequest {
+    None,
+    IfDue,
+    Now,
+}
+
+fn maybe_discover(
+    hook: &Option<DiscoverHook>,
+    cfg: &AppConfig,
+    request: DiscoveryRequest,
+    last: &mut Option<Instant>,
+) {
+    let due = match request {
+        DiscoveryRequest::None => false,
+        DiscoveryRequest::IfDue => last.is_none_or(|t| t.elapsed() >= DISCOVERY_INTERVAL),
+        DiscoveryRequest::Now => true,
+    };
+    if !due {
+        return;
+    }
+    if let Some(hook) = hook {
+        *last = Some(Instant::now());
+        if cfg.scan_roots.iter().any(|r| r.auto) {
+            tokio::spawn(hook(cfg.clone()));
+        }
+    }
+}
+
 fn config_affects_scan(previous: &AppConfig, next: &AppConfig) -> bool {
     previous.general.fetch_on_refresh != next.general.fetch_on_refresh
         || previous.repositories != next.repositories
@@ -83,6 +122,8 @@ where
     /// Used by the GUI bootstrap to re-register the global shortcut on the
     /// fly when the user changes `gui.global_shortcut`.
     pub on_config_reloaded: Option<ConfigReloadedHook>,
+    /// Scan-root discovery hook (see [`DiscoverHook`]).
+    pub discover: Option<DiscoverHook>,
 }
 
 /// Channels and lifecycle signals wired into [`run_realtime_loop`].
@@ -203,6 +244,13 @@ pub async fn run_realtime_loop<E, S, L, R>(
     let mut pending_manual_scan = false;
     let mut current_scan_is_manual = false;
     let mut manual_refresh_open = true;
+    let mut last_discovery: Option<Instant> = None;
+    maybe_discover(
+        &deps.discover,
+        &current_cfg,
+        DiscoveryRequest::Now,
+        &mut last_discovery,
+    );
 
     loop {
         tokio::select! {
@@ -212,6 +260,12 @@ pub async fn run_realtime_loop<E, S, L, R>(
                 if maybe_refresh.is_some() {
                     // Drain any additional pending signals to coalesce burst refreshes.
                     while manual_refresh_rx.try_recv().is_ok() {}
+                    maybe_discover(
+                        &deps.discover,
+                        &current_cfg,
+                        DiscoveryRequest::Now,
+                        &mut last_discovery,
+                    );
                     pending_scan = true;
                     pending_manual_scan = true;
                     if scanning.is_none() && pending_scan {
@@ -226,7 +280,8 @@ pub async fn run_realtime_loop<E, S, L, R>(
             }
             maybe_evt = event_rx.recv() => {
                 let Some(evt) = maybe_evt else { break };
-                handle_event(
+                let mut discovery = DiscoveryRequest::None;
+                discovery = discovery.max(handle_event(
                     evt,
                     &mut current_cfg,
                     &mut current_path,
@@ -234,9 +289,9 @@ pub async fn run_realtime_loop<E, S, L, R>(
                     &mut deps,
                     &mut throttle,
                     &mut pending_scan,
-                ).await;
+                ).await);
                 while let Ok(evt) = event_rx.try_recv() {
-                    handle_event(
+                    discovery = discovery.max(handle_event(
                         evt,
                         &mut current_cfg,
                         &mut current_path,
@@ -244,8 +299,9 @@ pub async fn run_realtime_loop<E, S, L, R>(
                         &mut deps,
                         &mut throttle,
                         &mut pending_scan,
-                    ).await;
+                    ).await);
                 }
+                maybe_discover(&deps.discover, &current_cfg, discovery, &mut last_discovery);
                 if scanning.is_none() && pending_scan {
                     pending_scan = false;
                     current_scan_is_manual = pending_manual_scan;
@@ -264,8 +320,9 @@ pub async fn run_realtime_loop<E, S, L, R>(
                     }
                 }
                 current_scan_is_manual = false;
+                let mut discovery = DiscoveryRequest::None;
                 while let Ok(evt) = event_rx.try_recv() {
-                    handle_event(
+                    discovery = discovery.max(handle_event(
                         evt,
                         &mut current_cfg,
                         &mut current_path,
@@ -273,8 +330,9 @@ pub async fn run_realtime_loop<E, S, L, R>(
                         &mut deps,
                         &mut throttle,
                         &mut pending_scan,
-                    ).await;
+                    ).await);
                 }
+                maybe_discover(&deps.discover, &current_cfg, discovery, &mut last_discovery);
                 if pending_scan {
                     pending_scan = false;
                     current_scan_is_manual = pending_manual_scan;
@@ -298,7 +356,8 @@ async fn handle_event<E, S, L, R>(
     deps: &mut RealtimeDeps<S, L, R>,
     throttle: &mut ErrorThrottle,
     pending_scan: &mut bool,
-) where
+) -> DiscoveryRequest
+where
     E: Emitter,
     S: Fn(AppConfig) -> BoxFuture<'static, Result<ListRepositoriesResponse, CommandError>>
         + Send
@@ -308,7 +367,11 @@ async fn handle_event<E, S, L, R>(
     R: FnMut(WatcherConfig) -> anyhow::Result<()> + Send + 'static,
 {
     match evt {
-        WatchEvent::Tick | WatchEvent::RepoChanged { .. } => {
+        WatchEvent::Tick => {
+            *pending_scan = true;
+            return DiscoveryRequest::IfDue;
+        }
+        WatchEvent::RepoChanged { .. } => {
             *pending_scan = true;
         }
         WatchEvent::ConfigChanged => match (deps.load_config)() {
@@ -316,6 +379,11 @@ async fn handle_event<E, S, L, R>(
                 let reload_needed =
                     watcher_config_changed(current_cfg, &new_cfg, current_path.clone());
                 let scan_needed = config_affects_scan(current_cfg, &new_cfg);
+                let discovery = if current_cfg.scan_roots != new_cfg.scan_roots {
+                    DiscoveryRequest::Now
+                } else {
+                    DiscoveryRequest::None
+                };
 
                 if reload_needed {
                     let wc = watcher_config_from_app_config(&new_cfg, current_path.clone());
@@ -323,7 +391,7 @@ async fn handle_event<E, S, L, R>(
                         if throttle.should_emit("reload", &e.to_string()) {
                             emitter.emit_error(&make_error("reload", e.to_string()));
                         }
-                        return;
+                        return DiscoveryRequest::None;
                     }
                 }
 
@@ -347,6 +415,7 @@ async fn handle_event<E, S, L, R>(
                 if scan_needed {
                     *pending_scan = true;
                 }
+                return discovery;
             }
             Err(e) => {
                 if throttle.should_emit("config", &e.to_string()) {
@@ -360,6 +429,7 @@ async fn handle_event<E, S, L, R>(
             }
         }
     }
+    DiscoveryRequest::None
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +612,22 @@ pub async fn bootstrap_and_run(
         Ok((mut watcher, event_rx)) => {
             let scan_handle = handle.clone();
             let deps = RealtimeDeps {
+                discover: Some(std::sync::Arc::new({
+                    let discover_handle = handle.clone();
+                    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    move |cfg: AppConfig| {
+                        let handle = discover_handle.clone();
+                        let running = running.clone();
+                        Box::pin(async move {
+                            use std::sync::atomic::Ordering;
+                            if running.swap(true, Ordering::AcqRel) {
+                                return;
+                            }
+                            crate::commands::run_discovery(&handle, cfg).await;
+                            running.store(false, Ordering::Release);
+                        })
+                    }
+                })),
                 scan: move |cfg| {
                     let handle = scan_handle.clone();
                     Box::pin(async move { scan_with_bootstrap(&handle, cfg).await })
@@ -784,6 +870,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (manual_refresh_tx, manual_refresh_rx) = mpsc::channel::<()>(8);
         let deps = RealtimeDeps {
+            discover: None,
             scan,
             load_config: load,
             reload_watcher: reload,
@@ -1054,6 +1141,118 @@ mod tests {
         assert_eq!(errors[0].message, "oops");
     }
 
+    fn auto_root_config() -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.scan_roots
+            .push(git_clawler_core::config::ScanRootEntry {
+                path: std::env::temp_dir(),
+                depth: 1,
+                exclude: Vec::new(),
+                distro: None,
+                auto: true,
+                worktrees: true,
+            });
+        cfg
+    }
+
+    #[tokio::test]
+    async fn discovery_runs_at_startup_on_manual_refresh_and_root_change_only() {
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let emitter = MockEmitter::default();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (tx, rx) = mpsc::channel::<WatchEvent>(8);
+        let (manual_refresh_tx, manual_refresh_rx) = mpsc::channel::<()>(1);
+        // Each reload reports a different scan-root depth, so ConfigChanged
+        // counts as a scan-root change.
+        let reloads = Arc::new(AtomicUsize::new(0));
+        let deps = RealtimeDeps {
+            discover: Some(Arc::new(move |_cfg: AppConfig| {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {})
+            })),
+            scan: ok_scanner(),
+            load_config: move || {
+                let mut cfg = auto_root_config();
+                cfg.scan_roots[0].depth = 2 + reloads.fetch_add(1, Ordering::SeqCst) as u32;
+                Ok(cfg)
+            },
+            reload_watcher: noop_reload(),
+            on_config_reloaded: None,
+        };
+        let emitter_clone = emitter.clone();
+        let handle = tokio::spawn(async move {
+            run_realtime_loop(
+                auto_root_config(),
+                None,
+                RealtimeChannels {
+                    event_rx: rx,
+                    manual_refresh_rx,
+                    shutdown: shutdown_rx,
+                    completion_tx: None,
+                },
+                emitter_clone,
+                deps,
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "startup");
+        tx.send(WatchEvent::Tick).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "tick before interval");
+        manual_refresh_tx.send(()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "manual refresh");
+        tx.send(WatchEvent::ConfigChanged).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "scan roots changed");
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_skipped_without_auto_roots() {
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (_tx, rx) = mpsc::channel::<WatchEvent>(8);
+        let (_manual_refresh_tx, manual_refresh_rx) = mpsc::channel::<()>(1);
+        let deps = RealtimeDeps {
+            discover: Some(Arc::new(move |_cfg: AppConfig| {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {})
+            })),
+            scan: ok_scanner(),
+            load_config: ok_loader(),
+            reload_watcher: noop_reload(),
+            on_config_reloaded: None,
+        };
+        let mut manual_only = auto_root_config();
+        manual_only.scan_roots[0].auto = false;
+        let handle = tokio::spawn(async move {
+            run_realtime_loop(
+                manual_only,
+                None,
+                RealtimeChannels {
+                    event_rx: rx,
+                    manual_refresh_rx,
+                    shutdown: shutdown_rx,
+                    completion_tx: None,
+                },
+                MockEmitter::default(),
+                deps,
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn config_changed_invokes_on_config_reloaded_callback() {
         use std::sync::Arc;
@@ -1065,6 +1264,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<WatchEvent>(8);
         let (_manual_refresh_tx, manual_refresh_rx) = mpsc::channel::<()>(1);
         let deps = RealtimeDeps {
+            discover: None,
             scan: ok_scanner(),
             load_config: shortcut_changed_loader(),
             reload_watcher: noop_reload(),
@@ -1111,6 +1311,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<WatchEvent>(8);
         let (_manual_refresh_tx, manual_refresh_rx) = mpsc::channel::<()>(1);
         let deps = RealtimeDeps {
+            discover: None,
             scan: ok_scanner(),
             load_config: ok_loader(),
             reload_watcher: noop_reload(),
@@ -1159,6 +1360,7 @@ mod tests {
             Ok(cfg)
         };
         let deps = RealtimeDeps {
+            discover: None,
             scan: ok_scanner(),
             load_config,
             reload_watcher: noop_reload(),
@@ -1212,6 +1414,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<WatchEvent>(8);
         let (_manual_refresh_tx, manual_refresh_rx) = mpsc::channel::<()>(1);
         let deps = RealtimeDeps {
+            discover: None,
             scan: ok_scanner(),
             load_config: policy_changed_loader(),
             reload_watcher: noop_reload(),
@@ -1319,6 +1522,7 @@ mod tests {
         let failing_loader =
             || -> Result<AppConfig, anyhow::Error> { Err(anyhow::anyhow!("config parse failed")) };
         let deps = RealtimeDeps {
+            discover: None,
             scan: ok_scanner(),
             load_config: failing_loader,
             reload_watcher: noop_reload(),
@@ -1361,6 +1565,7 @@ mod tests {
         let (completion_tx, completion_rx) = oneshot::channel::<()>();
         let emitter = MockEmitter::default();
         let deps = RealtimeDeps {
+            discover: None,
             scan: ok_scanner(),
             load_config: ok_loader(),
             reload_watcher: noop_reload(),
@@ -1398,12 +1603,14 @@ mod tests {
         let cfg = AppConfig {
             repositories: vec![
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("native".into()),
                     path: native.path().to_path_buf(),
                     fetch: None,
                     distro: None,
                 },
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("wsl".into()),
                     path: PathBuf::from("/home/me/proj"),
                     fetch: None,

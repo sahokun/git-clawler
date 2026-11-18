@@ -1,21 +1,37 @@
 version: 2
+# Routine version updates arrive once a month as one grouped PR per ecosystem.
+# They are reminders: re-check the seven-day rule for transitive dependencies,
+# regenerate notices and keep Tauri Rust/JS versions aligned before merging.
+# Security updates are configured in repository settings and are not grouped.
 updates:
   - package-ecosystem: cargo
     directory: /
-    open-pull-requests-limit: 2
+    open-pull-requests-limit: 1
     schedule:
-      interval: weekly
+      interval: monthly
     cooldown:
       default-days: 7
+    groups:
+      cargo-monthly:
+        applies-to: version-updates
+        patterns: ["*"]
   - package-ecosystem: npm
     directory: /crates/gui
-    open-pull-requests-limit: 2
+    open-pull-requests-limit: 1
     schedule:
-      interval: weekly
+      interval: monthly
     cooldown:
       default-days: 7
+    groups:
+      npm-monthly:
+        applies-to: version-updates
+        patterns: ["*"]
   - package-ecosystem: github-actions
     directory: /
-    open-pull-requests-limit: 2
+    open-pull-requests-limit: 1
     schedule:
-      interval: weekly
+      interval: monthly
+    groups:
+      actions-monthly:
+        applies-to: version-updates
+        patterns: ["*"]

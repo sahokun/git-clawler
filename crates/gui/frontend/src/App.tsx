@@ -14,6 +14,7 @@ import {
   subscribeRepositoriesError,
   subscribeShortcutStatus,
   subscribeSettingsOpen,
+  removeRepository,
 } from './api'
 import type { AppConfigDto, ListRepositoriesResponse, RealtimeErrorPayload } from './types'
 import { SettingsDialog } from './settings/SettingsDialog'
@@ -29,6 +30,7 @@ import {
   hasChanges,
   matchesSearch,
   repoKey,
+  groupWorktrees,
   summarize,
   toViewModel,
 } from './hybridUi'
@@ -88,6 +90,8 @@ function errorMessage(e: unknown): string {
 
 function App() {
   const [state, setState] = useState<State>({ status: 'loading' })
+  // A manual refresh keeps the current rows on screen until new ones arrive.
+  const [refreshing, setRefreshing] = useState(false)
   const [watcherError, setWatcherError] = useState<RealtimeErrorPayload | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [guiConfig, setGuiConfig] = useState<AppConfigDto | null>(null)
@@ -142,10 +146,12 @@ function App() {
   }, [])
 
   const refreshRepos = useCallback(async () => {
-    setState({ status: 'loading' })
+    setState(previous => (previous.status === 'ready' ? previous : { status: 'loading' }))
+    setRefreshing(true)
     try {
       await requestRefresh()
     } catch (e) {
+      setRefreshing(false)
       setWatcherError({
         kind: 'refresh',
         message: errorMessage(e),
@@ -198,6 +204,7 @@ function App() {
 
     subscribeRepositories(e => {
       setState({ status: 'ready', data: e.payload })
+      setRefreshing(false)
       setWatcherError(previous => previous?.kind === 'shortcut' ? previous : null)
       setSelectedKey(previous => previous ?? (e.payload.rows[0] ? repoKey(e.payload.rows[0]) : null))
     })
@@ -217,6 +224,7 @@ function App() {
 
     subscribeRepositoriesError(e => {
       setWatcherError(e.payload)
+      setRefreshing(false)
       setState(previous => (
         previous.status === 'loading'
           ? { status: 'error', error: e.payload.message }
@@ -322,6 +330,7 @@ function App() {
     pendingWidthsRef.current = columnWidths
   }
 
+  const busy = state.status === 'loading' || refreshing
   const allViews = useMemo(() => (state.status === 'ready' ? state.data.rows.map(toViewModel) : []), [state])
 
   const filteredViews = useMemo(() => allViews.filter(view => {
@@ -360,10 +369,10 @@ function App() {
   const minTableWidth = TABLE_COLUMNS.reduce((sum, column) => sum + columnWidths[column.key], 0)
 
   const groups = useMemo(() => {
-    if (groupMode === 'none') return [{ key: 'all', label: null as string | null, views: filteredViews }]
+    if (groupMode === 'none') return [{ key: 'all', label: null as string | null, views: groupWorktrees(filteredViews) }]
     return [
-      { key: 'native', label: 'Native', views: filteredViews.filter(view => view.host === 'native') },
-      { key: 'wsl', label: 'WSL', views: filteredViews.filter(view => view.host === 'wsl') },
+      { key: 'native', label: 'Native', views: groupWorktrees(filteredViews.filter(view => view.host === 'native')) },
+      { key: 'wsl', label: 'WSL', views: groupWorktrees(filteredViews.filter(view => view.host === 'wsl')) },
     ].filter(group => group.views.length > 0)
   }, [filteredViews, groupMode])
 
@@ -378,6 +387,23 @@ function App() {
   const handleOpenFolder = async (view: ReturnType<typeof toViewModel>) => {
     try {
       await openRepositoryFolder(view.row.path, view.row.distro)
+      setPreferenceError(null)
+    } catch (e) {
+      setPreferenceError(errorMessage(e))
+    }
+  }
+
+  const handleRemove = async (view: ReturnType<typeof toViewModel>) => {
+    try {
+      await removeRepository(view.row.path, view.row.distro)
+      // Drop the row now; the rescan triggered by the config change reconciles.
+      const removedKey = repoKey(view.row)
+      setState(previous => (
+        previous.status === 'ready'
+          ? { status: 'ready', data: { ...previous.data, rows: previous.data.rows.filter(row => repoKey(row) !== removedKey) } }
+          : previous
+      ))
+      setDetailOpen(false)
       setPreferenceError(null)
     } catch (e) {
       setPreferenceError(errorMessage(e))
@@ -406,7 +432,7 @@ function App() {
           <img className="gc-brand-mark" src={appIcon} alt="" aria-hidden="true" />
           <div className="gc-brand-chip" aria-label="Workspace summary">
             <GitBranch className="h-3.5 w-3.5" />
-            <span>{totals.repos} repos</span>
+            <span>{totals.repos} repos{totals.worktrees > 0 ? ` (+${totals.worktrees} worktrees)` : ''}</span>
             <span className="gc-chip-separator">·</span>
             <span>{guiConfig?.scan_roots.length ?? 0} roots</span>
           </div>
@@ -415,9 +441,9 @@ function App() {
           <FieldTip tip={`Auto-refresh interval is ${refreshInterval} seconds.`} className="gc-auto-chip">
             <Clock className="h-3.5 w-3.5" /> auto · {refreshInterval}s <span className="gc-live-dot" />
           </FieldTip>
-          <Button onClick={refreshRepos} disabled={state.status === 'loading'} className="gc-primary-btn">
-            <RefreshCw className={`h-4 w-4 ${state.status === 'loading' ? 'animate-spin' : ''}`} />
-            {state.status === 'loading' ? 'Loading...' : 'Refresh now'}
+          <Button onClick={refreshRepos} disabled={busy} className="gc-primary-btn">
+            <RefreshCw className={`h-4 w-4 ${busy ? 'animate-spin' : ''}`} />
+            {busy ? 'Loading...' : 'Refresh now'}
           </Button>
           <Button variant="ghost" size="icon" onClick={() => setSettingsOpen(true)} aria-label="Settings">
             <Settings className="h-5 w-5" />
@@ -516,6 +542,7 @@ function App() {
             onClose={() => setDetailOpen(false)}
             onOpenFolder={handleOpenFolder}
             onOpenGithub={handleOpenGithub}
+            onRemove={handleRemove}
           />
         )}
       </main>

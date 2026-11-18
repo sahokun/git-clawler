@@ -40,10 +40,24 @@ pub(crate) async fn run_with_config_path(
         })?;
 
     config.repositories = registry.to_config_entries();
+    let removed_entry = git_clawler_core::config::RepoEntry {
+        name: None,
+        path: removed.path().to_path_buf(),
+        fetch: None,
+        distro: removed.distro.clone(),
+        worktree_of: removed.worktree_of.clone(),
+    };
+    let exclusion = git_clawler_core::discovery::record_exclusion(&mut config, &removed_entry);
     config::save_to(&config, &config_path)
         .with_context(|| format!("failed to save config to {}", config_path.display()))?;
 
     println!("Removed from config: {}", removed.path().display());
+    if let Some((root, pattern)) = exclusion {
+        println!(
+            "Excluded from automatic discovery under {}: {pattern}",
+            root.display()
+        );
+    }
     Ok(())
 }
 

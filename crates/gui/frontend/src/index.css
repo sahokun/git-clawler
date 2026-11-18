@@ -1234,3 +1234,21 @@ input {
   color: var(--gc-warn);
   font-size: 11px;
 }
+
+/* Linked worktrees rendered under their main repository. */
+.gc-grid-row.is-worktree .gc-grid-cell.repo {
+	padding-left: 1.25rem;
+}
+
+.gc-worktree-badge {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.2rem;
+	margin-right: 0.35rem;
+	padding: 0 0.3rem;
+	border: 1px solid currentColor;
+	border-radius: 0.25rem;
+	font-size: 0.68rem;
+	opacity: 0.75;
+	vertical-align: middle;
+}

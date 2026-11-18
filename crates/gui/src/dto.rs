@@ -24,6 +24,9 @@ pub struct RepoRow {
     pub distro: Option<String>,
     #[serde(default)]
     pub remote_url: Option<String>,
+    /// Main repository path when this row is a linked worktree.
+    #[serde(default)]
+    pub worktree_of: Option<String>,
 }
 
 /// Per-repository scan outcome.
@@ -35,6 +38,8 @@ pub struct RepoRow {
 pub enum RowStatus {
     Ok(RepoStatusDto),
     Err(String),
+    /// The registered path no longer exists. Never removed automatically.
+    NotFound(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +116,14 @@ pub struct RepoEntryDto {
     pub path: String,
     pub fetch: Option<bool>,
     pub distro: Option<String>,
+    /// Main repository path for an auto-registered linked worktree; carried
+    /// through Settings saves so it is not lost.
+    #[serde(default)]
+    pub worktree_of: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +132,10 @@ pub struct ScanRootEntryDto {
     pub depth: u32,
     pub exclude: Vec<String>,
     pub distro: Option<String>,
+    #[serde(default = "default_true")]
+    pub auto: bool,
+    #[serde(default = "default_true")]
+    pub worktrees: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +184,7 @@ impl From<AppConfig> for AppConfigDto {
                     path: r.path.to_string_lossy().into_owned(),
                     fetch: r.fetch,
                     distro: r.distro,
+                    worktree_of: r.worktree_of.map(|p| p.to_string_lossy().into_owned()),
                 })
                 .collect(),
             scan_roots: cfg
@@ -177,6 +195,8 @@ impl From<AppConfig> for AppConfigDto {
                     depth: s.depth,
                     exclude: s.exclude,
                     distro: s.distro,
+                    auto: s.auto,
+                    worktrees: s.worktrees,
                 })
                 .collect(),
             github: GithubConfigDto {
@@ -227,6 +247,7 @@ impl TryFrom<AppConfigDto> for AppConfig {
                 .repositories
                 .into_iter()
                 .map(|r| RepoEntry {
+                    worktree_of: r.worktree_of.map(PathBuf::from),
                     name: r.name,
                     path: PathBuf::from(&r.path),
                     fetch: r.fetch,
@@ -237,6 +258,8 @@ impl TryFrom<AppConfigDto> for AppConfig {
                 .scan_roots
                 .into_iter()
                 .map(|s| ScanRootEntry {
+                    auto: s.auto,
+                    worktrees: s.worktrees,
                     path: PathBuf::from(&s.path),
                     depth: s.depth,
                     exclude: s.exclude,
@@ -285,6 +308,7 @@ mod tests {
     fn app_config_dto_roundtrip_with_distro() {
         let cfg = AppConfig {
             repositories: vec![RepoEntry {
+                worktree_of: None,
                 name: Some("proj".into()),
                 path: PathBuf::from("/home/user/proj"),
                 fetch: None,
@@ -303,6 +327,8 @@ mod tests {
     fn app_config_dto_roundtrip_scan_root_with_distro() {
         let cfg = AppConfig {
             scan_roots: vec![ScanRootEntry {
+                auto: true,
+                worktrees: true,
                 path: PathBuf::from("/home/user/workspace"),
                 depth: 4,
                 exclude: vec!["target".into()],

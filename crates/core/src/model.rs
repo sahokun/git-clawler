@@ -40,6 +40,10 @@ pub struct Repository {
     /// must be scanned via the wsl-helper rather than natively.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distro: Option<String>,
+    /// Main repository working directory for a registered linked worktree
+    /// (mirrors [`crate::config::RepoEntry::worktree_of`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_of: Option<PathBuf>,
 }
 
 impl Repository {
@@ -54,6 +58,7 @@ impl Repository {
             last_scanned: None,
             fetch: None,
             distro: None,
+            worktree_of: None,
         }
     }
 
@@ -66,6 +71,12 @@ impl Repository {
     /// Builder-style setter for [`Self::distro`].
     pub fn with_distro(mut self, distro: Option<String>) -> Self {
         self.distro = distro;
+        self
+    }
+
+    /// Builder-style setter for [`Self::worktree_of`].
+    pub fn with_worktree_of(mut self, worktree_of: Option<PathBuf>) -> Self {
+        self.worktree_of = worktree_of;
         self
     }
 
@@ -115,6 +126,9 @@ pub struct RepoStatus {
     /// Newest commits reachable from `HEAD`, most recent first.
     #[serde(default)]
     pub recent_commits: Vec<RecentCommit>,
+    /// Main repository working directory when this is a linked worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_parent: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +300,7 @@ mod tests {
     #[test]
     fn repository_serde_roundtrip() {
         let repo = Repository {
+            worktree_of: None,
             name: "test-repo".to_string(),
             path: PathBuf::from("/tmp/test-repo"),
             status: Some(RepoStatus {
@@ -304,6 +319,7 @@ mod tests {
                     open_prs: Some(1),
                 }),
                 conflict_predicted: None,
+                worktree_parent: None,
                 recent_commits: vec![],
             }),
             last_scanned: Some(Utc::now()),

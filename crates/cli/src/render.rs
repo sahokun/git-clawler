@@ -24,7 +24,7 @@ pub fn format_watch_footer(last: DateTime<Utc>, interval_secs: u64) -> String {
 
 pub fn render_list_table(rows: &[ListRow], color: bool, show_github: bool) -> String {
     let mut table = Table::new();
-    table.load_preset(UTF8_FULL);
+    table.load_style(UTF8_FULL);
     let mut header = vec![
         "Repository",
         "Branch",

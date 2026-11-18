@@ -53,6 +53,8 @@ pub enum ConfigError {
         distro: Option<String>,
         path: PathBuf,
     },
+    #[error("scan root depth must be 0..=32, got {depth}: {path}")]
+    ScanDepthTooLarge { path: PathBuf, depth: u32 },
     #[error("duplicate scan root (distro={distro:?}) path: {path}")]
     DuplicateScanRoot {
         distro: Option<String>,
@@ -91,6 +93,7 @@ pub fn config_error_kind(err: &ConfigError) -> &'static str {
         ConfigError::RelativePath(_)
         | ConfigError::DuplicateRepository { .. }
         | ConfigError::DuplicateScanRoot { .. }
+        | ConfigError::ScanDepthTooLarge { .. }
         | ConfigError::InvalidWslPath { .. }
         | ConfigError::InvalidGuiSize { .. }
         | ConfigError::ZeroRefreshInterval
@@ -159,6 +162,12 @@ pub struct RepoEntry {
     /// natively.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distro: Option<String>,
+    /// Main repository working directory when this entry is a linked worktree
+    /// registered by scan-root discovery. Entries with this set are removed
+    /// automatically once Git no longer tracks the worktree; other entries are
+    /// never removed automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_of: Option<PathBuf>,
 }
 
 /// A directory to recursively scan for git repositories.
@@ -166,12 +175,21 @@ pub struct RepoEntry {
 pub struct ScanRootEntry {
     /// Absolute path to the scan root directory.
     pub path: PathBuf,
-    /// Maximum directory depth to scan.
+    /// Maximum directory depth to scan (1 = direct children). Used by both the
+    /// manual Scan action and automatic discovery.
     #[serde(default = "default_depth")]
     pub depth: u32,
-    /// Glob patterns of subdirectories to exclude.
+    /// Exclusions: a directory name (matches at any level), a path relative to
+    /// the root (contains `/`), or an absolute path.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Automatically register repositories discovered under this root.
+    #[serde(default = "default_true")]
+    pub auto: bool,
+    /// Also register linked worktrees of discovered repositories, wherever
+    /// they live.
+    #[serde(default = "default_true")]
+    pub worktrees: bool,
     /// Optional WSL distribution name. When set, `path` is interpreted as a
     /// Linux absolute path inside that distro and scanned via the WSL helper.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,7 +197,11 @@ pub struct ScanRootEntry {
 }
 
 fn default_depth() -> u32 {
-    3
+    1
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// GitHub integration settings.
@@ -417,6 +439,12 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
                     path: root.path.clone(),
                 });
             }
+        }
+        if root.depth > MAX_SCAN_DEPTH {
+            return Err(ConfigError::ScanDepthTooLarge {
+                path: root.path.clone(),
+                depth: root.depth,
+            });
         }
         let key = DistroPathKey::current_host(normalized.as_deref(), &root.path);
         if !seen_scan_roots.insert(key) {
@@ -705,12 +733,15 @@ mod tests {
                 fetch_on_refresh: true,
             },
             repositories: vec![RepoEntry {
+                worktree_of: None,
                 name: Some("my-repo".into()),
                 path: PathBuf::from("/home/user/my-repo"),
                 fetch: Some(true),
                 distro: None,
             }],
             scan_roots: vec![ScanRootEntry {
+                auto: true,
+                worktrees: true,
                 path: dir.path().join("projects"),
                 depth: 2,
                 exclude: vec!["target".to_string()],
@@ -815,7 +846,28 @@ path = "{root_path}"
         )
         .unwrap();
         let cfg = load_from(&path).unwrap();
-        assert_eq!(cfg.scan_roots[0].depth, 3);
+        // Existing configs without the new keys get direct-children depth and
+        // auto-follow (including worktrees) enabled.
+        assert_eq!(cfg.scan_roots[0].depth, 1);
+        assert!(cfg.scan_roots[0].auto);
+        assert!(cfg.scan_roots[0].worktrees);
+    }
+
+    #[test]
+    fn scan_root_depth_above_limit_is_rejected() {
+        let mut cfg = AppConfig::default();
+        cfg.scan_roots.push(ScanRootEntry {
+            path: std::env::temp_dir(),
+            depth: MAX_SCAN_DEPTH + 1,
+            exclude: Vec::new(),
+            distro: None,
+            auto: true,
+            worktrees: true,
+        });
+        assert!(matches!(
+            validate(&cfg),
+            Err(ConfigError::ScanDepthTooLarge { .. })
+        ));
     }
 
     #[test]
@@ -848,6 +900,7 @@ path = "/home/user/project"
     fn validate_rejects_relative_repo_path() {
         let cfg = AppConfig {
             repositories: vec![RepoEntry {
+                worktree_of: None,
                 name: None,
                 path: PathBuf::from("relative/path"),
                 fetch: None,
@@ -864,12 +917,14 @@ path = "/home/user/project"
         let cfg = AppConfig {
             repositories: vec![
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("a".into()),
                     path: PathBuf::from("/tmp/dup"),
                     fetch: None,
                     distro: None,
                 },
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("b".into()),
                     path: PathBuf::from("/tmp/dup"),
                     fetch: None,
@@ -889,6 +944,8 @@ path = "/home/user/project"
     fn validate_rejects_relative_scan_root() {
         let cfg = AppConfig {
             scan_roots: vec![ScanRootEntry {
+                auto: true,
+                worktrees: true,
                 path: PathBuf::from("relative"),
                 depth: 3,
                 exclude: vec![],
@@ -905,6 +962,8 @@ path = "/home/user/project"
     fn validate_accepts_wsl_style_scan_root_on_windows() {
         let cfg = AppConfig {
             scan_roots: vec![ScanRootEntry {
+                auto: true,
+                worktrees: true,
                 path: PathBuf::from("/home/user/projects"),
                 depth: 3,
                 exclude: vec![],
@@ -920,6 +979,8 @@ path = "/home/user/project"
     fn validate_accepts_wsl_scan_root_with_distro() {
         let cfg = AppConfig {
             scan_roots: vec![ScanRootEntry {
+                auto: true,
+                worktrees: true,
                 path: PathBuf::from("/home/user/projects"),
                 depth: 3,
                 exclude: vec![],
@@ -935,6 +996,8 @@ path = "/home/user/project"
     fn validate_rejects_wsl_scan_root_distro_with_non_linux_path() {
         let cfg = AppConfig {
             scan_roots: vec![ScanRootEntry {
+                auto: true,
+                worktrees: true,
                 path: PathBuf::from("relative"),
                 depth: 3,
                 exclude: vec![],
@@ -951,12 +1014,16 @@ path = "/home/user/project"
         let cfg = AppConfig {
             scan_roots: vec![
                 ScanRootEntry {
+                    auto: true,
+                    worktrees: true,
                     path: PathBuf::from("/home/user/projects"),
                     depth: 3,
                     exclude: vec![],
                     distro: Some("Ubuntu".into()),
                 },
                 ScanRootEntry {
+                    auto: true,
+                    worktrees: true,
                     path: PathBuf::from("/home/user/projects"),
                     depth: 2,
                     exclude: vec![],
@@ -978,6 +1045,7 @@ path = "/home/user/project"
         let path = dir.path().join("config.toml");
         let cfg = AppConfig {
             repositories: vec![RepoEntry {
+                worktree_of: None,
                 name: None,
                 path: PathBuf::from("relative/path"),
                 fetch: None,
@@ -1059,6 +1127,7 @@ path = "/home/user/project"
         // Write initial config
         let original = AppConfig {
             repositories: vec![RepoEntry {
+                worktree_of: None,
                 name: Some("orig".into()),
                 path: PathBuf::from("/tmp/orig"),
                 fetch: None,
@@ -1071,6 +1140,7 @@ path = "/home/user/project"
         // Overwrite with new config
         let updated = AppConfig {
             repositories: vec![RepoEntry {
+                worktree_of: None,
                 name: Some("updated".into()),
                 path: PathBuf::from("/tmp/updated"),
                 fetch: None,
@@ -1252,7 +1322,7 @@ max_depth = 5
         assert!(!cfg.gui.start_in_tray);
         assert_eq!(cfg.github.token_env, "GITHUB_TOKEN");
         assert!(cfg.github.enabled);
-        assert_eq!(cfg.scan_roots[0].depth, 3);
+        assert_eq!(cfg.scan_roots[0].depth, 1);
     }
 
     // ----- distro / WSL path tests -----
@@ -1292,12 +1362,14 @@ max_depth = 5
         let cfg = AppConfig {
             repositories: vec![
                 RepoEntry {
+                    worktree_of: None,
                     name: None,
                     path: PathBuf::from("/home/user/proj"),
                     fetch: None,
                     distro: None,
                 },
                 RepoEntry {
+                    worktree_of: None,
                     name: None,
                     path: PathBuf::from("/home/user/proj"),
                     fetch: None,
@@ -1314,12 +1386,14 @@ max_depth = 5
         let cfg = AppConfig {
             repositories: vec![
                 RepoEntry {
+                    worktree_of: None,
                     name: None,
                     path: PathBuf::from("/home/user/proj"),
                     fetch: None,
                     distro: Some("Ubuntu".into()),
                 },
                 RepoEntry {
+                    worktree_of: None,
                     name: None,
                     path: PathBuf::from("/home/user/proj"),
                     fetch: None,
@@ -1335,6 +1409,7 @@ max_depth = 5
     #[test]
     fn repo_entry_serde_roundtrip_with_distro() {
         let entry = RepoEntry {
+            worktree_of: None,
             name: Some("proj".into()),
             path: PathBuf::from("/home/user/proj"),
             fetch: None,
@@ -1348,6 +1423,7 @@ max_depth = 5
     #[test]
     fn repo_entry_serde_skips_distro_when_none() {
         let entry = RepoEntry {
+            worktree_of: None,
             name: Some("proj".into()),
             path: PathBuf::from("/home/user/proj"),
             fetch: None,
@@ -1379,6 +1455,7 @@ max_depth = 5
     fn validate_wsl_entry_with_linux_path_ok() {
         let config = AppConfig {
             repositories: vec![RepoEntry {
+                worktree_of: None,
                 name: Some("wsl".into()),
                 path: PathBuf::from("/home/user/proj"),
                 fetch: None,
@@ -1476,12 +1553,15 @@ distro = "   "
         let path = dir.path().join("config.toml");
         let cfg = AppConfig {
             repositories: vec![RepoEntry {
+                worktree_of: None,
                 name: Some("repo".into()),
                 path: PathBuf::from("/home/user/repo"),
                 fetch: None,
                 distro: Some(" Ubuntu ".into()),
             }],
             scan_roots: vec![ScanRootEntry {
+                auto: true,
+                worktrees: true,
                 path: PathBuf::from("/home/user/projects"),
                 depth: 3,
                 exclude: vec![],
@@ -1507,12 +1587,14 @@ distro = "   "
         let cfg = AppConfig {
             repositories: vec![
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("a".into()),
                     path: PathBuf::from("/tmp/dup"),
                     fetch: None,
                     distro: Some("   ".into()),
                 },
                 RepoEntry {
+                    worktree_of: None,
                     name: Some("b".into()),
                     path: PathBuf::from("/tmp/dup"),
                     fetch: None,
@@ -1533,6 +1615,7 @@ distro = "   "
         // distro="   " (空白) + path → normalize で distro=None になるため InvalidWslPath にならない
         let cfg = AppConfig {
             repositories: vec![RepoEntry {
+                worktree_of: None,
                 name: None,
                 path: PathBuf::from("/tmp/repo"),
                 fetch: None,

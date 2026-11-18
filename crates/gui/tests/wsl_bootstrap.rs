@@ -57,7 +57,7 @@ fn handshake_response(protocol_version: u32, helper_version: &str) -> RunOutput 
     RunOutput {
         status: Some(0),
         stdout: format!(
-            r#"{{"protocol_version":{protocol_version},"helper_version":"{helper_version}","capabilities":{{"populates_remote_url":true,"scans_roots":true,"populates_recent_commits":true}}}}"#
+            r#"{{"protocol_version":{protocol_version},"helper_version":"{helper_version}","capabilities":{{"populates_remote_url":true,"scans_roots":true,"populates_recent_commits":true,"discovers_roots":true,"reports_worktrees":true}}}}"#
         )
         .into_bytes(),
         stderr: vec![],

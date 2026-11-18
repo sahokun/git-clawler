@@ -16,7 +16,7 @@
 
 ## Installation
 
-The initial release is 1.0.0, for Linux x86_64 and Windows 10/11 x86_64.
+Releases target Linux x86_64 and Windows 10/11 x86_64.
 Download assets and SHA256SUMS from [Releases](https://github.com/sahokun/git-clawler/releases).
 Verify the checksum before installation. Linux CLI and WSL helper assets are static musl binaries.
 Install the Linux CLI as `gclawl` in a directory on your PATH, for example:
@@ -24,7 +24,7 @@ Install the Linux CLI as `gclawl` in a directory on your PATH, for example:
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS
 mkdir -p ~/.local/bin
-install -m 755 gclawl-v1.0.0-linux-x86_64 ~/.local/bin/gclawl
+install -m 755 gclawl-v*-linux-x86_64 ~/.local/bin/gclawl
 ```
 
 Optional HTTPS fetch uses the system CA certificate store.
@@ -37,8 +37,16 @@ Windows packages are unsigned; Windows may display publisher or SmartScreen warn
 ## First registration and configuration
 
 In the Windows GUI, add repositories in Settings > Repositories, or configure
-Scan Roots and press Scan. On Linux, run `gclawl scan ~/projects --depth 3 --add`,
-then `gclawl list`. Removing an entry never deletes repository files.
+Scan Roots. A scan root with **Auto-follow** (the default) registers repositories
+below it automatically at startup, on Refresh and every 5 minutes, together with
+their linked worktrees wherever those live; worktrees are listed under their main
+repository. Press Scan to register once without auto-follow. On Linux, run
+`gclawl scan ~/projects --depth 3 --add`, then `gclawl list`.
+
+Removing an entry never deletes repository files. Removing an entry that an
+auto-follow root would find again adds it to that root's `exclude`. A registered
+path that no longer exists is shown as **Not found** and is only removed when you
+remove it; worktrees that Git no longer tracks are dropped automatically.
 
 Configuration lives at `~/.config/git-clawler/config.toml` on Linux
 (or `$XDG_CONFIG_HOME/git-clawler/config.toml`) and
@@ -53,6 +61,15 @@ fetch_on_refresh = false
 path = "/home/user/projects/example"
 # Windows GUI: set distro for a WSL repository; omit for native paths.
 # distro = "Ubuntu"
+
+[[scan_roots]]
+path = "/home/user/projects"
+depth = 1          # 1 = direct children (default); shared by Scan and auto-follow
+auto = true        # register new repositories automatically (default)
+worktrees = true   # also register linked worktrees (default)
+# Folder names, paths relative to the root, or absolute paths.
+exclude = ["archive", "old/app"]
+# distro = "Ubuntu" # Windows GUI: WSL root
 
 [github]
 enable_issues = false

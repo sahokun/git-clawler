@@ -43,6 +43,19 @@ export function subscribeShortcutStatus(
   return listen<ShortcutStatusPayload>(EVENT_SHORTCUT_STATUS, cb);
 }
 
+/** Backend changed `repositories` on disk (discovery or removal). */
+export function subscribeConfigRepositoriesChanged(cb: () => void): Promise<UnlistenFn> {
+  return listen<null>('config://repositories-changed', () => cb());
+}
+
+/** Remove a registered repository (never deletes files); may add a scan-root exclusion. */
+export async function removeRepository(
+  path: string,
+  distro: string | null,
+): Promise<{ excluded: [string, string] | null }> {
+  return invoke<{ excluded: [string, string] | null }>('remove_repository', { path, distro });
+}
+
 export function subscribeSettingsOpen(cb: () => void): Promise<UnlistenFn> {
   return listen<null>(EVENT_SETTINGS_OPEN, () => cb());
 }

@@ -154,6 +154,7 @@ fn main() {
             commands::get_config,
             commands::save_config,
             commands::save_column_widths,
+            commands::remove_repository,
             commands::request_refresh,
             commands::get_startup_errors,
             commands::open_repository_folder,

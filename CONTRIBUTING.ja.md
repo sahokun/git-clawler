@@ -6,12 +6,13 @@ Windows は MSVC C++ ビルドツール・Windows SDK・WebView2 が必要です
 
 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、
 `cargo test --workspace --locked`、`cargo deny check` を実行してください。
-GUI は `npm ci` 後に `npm test`、`npm run build`、`npm audit` を実行します。
+GUI は `npm ci` 後に `npm test`、`npm run build` を実行し、リポジトリ直下で `python3 scripts/audit-npm.py`（`npm-audit.toml` の審査済み例外つきの npm audit）を実行します。
 Windows 専用変更は Windows でも検証します。helper の配置・GUI 配布ビルド手順は英語版を参照してください。
 
 Conventional Commits で変更目的を分け、挙動変更には回帰テストを付けます。
 新規依存は公式レジストリで実在・保守・ライセンス・advisory を確認し、推移的依存を含め公開7日以上の版のみ採用します。
 例外は理由・対象・Issue・期限を明記し、期限を黙って延長しません。Git・設定処理は core に置きます。
+依存更新では `python3 scripts/refresh-deps.py check`（公開7日・yanked/deprecated・Tauri の Rust/JS 版ずれを検査、`--markdown FILE` で PR 用の表を出力）を実行します。`fix` は新しすぎる crate の固定、通知ファイル再生成、ライセンス補足の追加まで行います。
 公開文書は英語を正本とし、大きな変更は日本語版にも反映します。機密情報や個人設定を含めないでください。
 
 ## Node.jsの修正基準

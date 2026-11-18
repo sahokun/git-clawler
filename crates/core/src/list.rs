@@ -13,10 +13,12 @@
 //! row rather than aborting the whole batch.
 //!
 //! [`enrich_with_github`] enriches rows in-place with GitHub Issue/PR counts
-//! using bounded concurrency (cap [`GITHUB_CONCURRENCY`] = 4).  WSL-side
+//! using a few batched GraphQL requests (at most [`GITHUB_CONCURRENCY`] = 4
+//! in flight), one per group of repositories rather than one per row.  WSL-side
 //! `remote_url` is pre-populated by the GUI before calling this function so
 //! that `gh api` only needs to run on the Windows host.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -25,7 +27,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-/// Bounded concurrency cap for GitHub API calls during enrichment.
+/// Maximum number of batched GitHub requests in flight during enrichment.
 ///
 /// Exposed as a `pub const` so a follow-up can wire it through `[github].concurrency`
 /// config without further refactoring.
@@ -62,6 +64,39 @@ pub struct ListRow {
     ///   (resolved inside WSL via git2) so that `gh api` can run on the
     ///   Windows host without needing `gh` inside every distro.
     pub remote_url: Option<String>,
+}
+
+/// Remove, from each main repository row, unpushed branches that one of its
+/// linked worktree rows already reports, so a branch checked out in a
+/// worktree is counted once (on the worktree row).
+pub fn dedupe_worktree_branches(rows: &mut [ListRow]) {
+    use crate::path_key::DistroPathKey;
+    use std::collections::{HashMap, HashSet};
+    let mut by_parent: HashMap<DistroPathKey, HashSet<String>> = HashMap::new();
+    for row in rows.iter() {
+        if let ScanOutcome::Ok(status) = &row.outcome {
+            if let Some(parent) = &status.worktree_parent {
+                let key = DistroPathKey::current_host(row.target.distro.as_deref(), parent);
+                by_parent
+                    .entry(key)
+                    .or_default()
+                    .extend(status.unpushed_branches.iter().map(|b| b.name.clone()));
+            }
+        }
+    }
+    if by_parent.is_empty() {
+        return;
+    }
+    for row in rows.iter_mut() {
+        let key = DistroPathKey::current_host(row.target.distro.as_deref(), &row.target.path);
+        if let (ScanOutcome::Ok(status), Some(names)) = (&mut row.outcome, by_parent.get(&key)) {
+            if status.worktree_parent.is_none() {
+                status
+                    .unpushed_branches
+                    .retain(|b| !names.contains(&b.name));
+            }
+        }
+    }
 }
 
 /// Build [`ListTarget`] entries from an [`AppConfig`], marking the current
@@ -225,17 +260,17 @@ pub async fn scan_all_with_github(
     rows
 }
 
-/// Type alias for the boxed fetch-function used by [`do_enrich`].
+/// Type alias for the boxed batch fetch-function used by [`do_enrich`].
 ///
-/// Takes ownership of the remote URL and a clone of the GitHub config
-/// so the returned future is `Send + 'static` and can be spawned into a
-/// [`tokio::task::JoinSet`].
+/// Takes a chunk of `(owner, name)` slugs and a clone of the GitHub config
+/// and returns one result per slug, in order. The future owns its data so it
+/// is `Send + 'static` and can be spawned into a [`tokio::task::JoinSet`].
 pub(crate) type FetchFn = dyn Fn(
-        String,
+        Vec<crate::github::RepoSlug>,
         crate::config::GithubConfig,
-    )
-        -> Pin<Box<dyn std::future::Future<Output = Option<crate::GithubInfo>> + Send + 'static>>
-    + Send
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = Vec<Option<crate::GithubInfo>>> + Send + 'static>,
+    > + Send
     + Sync;
 
 /// Inner implementation of GitHub enrichment; parameterised over the fetch
@@ -248,19 +283,16 @@ pub(crate) async fn do_enrich(
     cfg: &crate::config::GithubConfig,
     fetch_fn: &FetchFn,
 ) {
-    // ── Step 1: Build remote-URL snapshot ──────────────────────────────────
+    // ── Step 1: Resolve each row's GitHub slug ─────────────────────────────
     // Prefer `row.remote_url` (pre-populated from WSL helper or CLI); fall
     // back to git2 (no subprocess) via spawn_blocking for native rows only.
-    let mut url_snapshot: Vec<Option<String>> = Vec::with_capacity(rows.len());
+    let mut row_slugs: Vec<Option<crate::github::RepoSlug>> = Vec::with_capacity(rows.len());
     for row in rows.iter() {
         let url = match &row.outcome {
             ScanOutcome::Ok(_) => {
                 if let Some(u) = row.remote_url.clone() {
                     Some(u)
                 } else {
-                    // Clone the path so it can be moved into the blocking
-                    // closure, which runs on Tokio's blocking thread pool to
-                    // avoid driving git2 I/O from an async context.
                     let path = row.target.path.clone();
                     match tokio::task::spawn_blocking(move || {
                         crate::github::get_origin_url_sync(&path)
@@ -280,77 +312,84 @@ pub(crate) async fn do_enrich(
             }
             ScanOutcome::Err(_) => None,
         };
-        url_snapshot.push(url);
+        row_slugs.push(url.as_deref().and_then(crate::github::parse_owner_repo));
     }
 
-    // ── Step 2: Collect (idx, url) pairs that have a remote URL ────────────
-    let inputs: Vec<(usize, String)> = url_snapshot
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, url)| url.map(|u| (i, u)))
-        .collect();
-
-    if inputs.is_empty() {
+    // ── Step 2: Unique slugs (worktrees share their main repository's remote)
+    let mut unique: Vec<crate::github::RepoSlug> = Vec::new();
+    let mut slot: HashMap<crate::github::RepoSlug, usize> = HashMap::new();
+    for slug in row_slugs.iter().flatten() {
+        if !slot.contains_key(slug) {
+            slot.insert(slug.clone(), unique.len());
+            unique.push(slug.clone());
+        }
+    }
+    if unique.is_empty() {
         return;
     }
 
-    // ── Step 3: Bounded-concurrent GitHub API calls ─────────────────────────
-    // Cap = GITHUB_CONCURRENCY to stay under GitHub secondary-rate-limit
-    // pressure while keeping tail latency ≈ ceil(N/4) × single-call latency.
+    // ── Step 3: Batched GraphQL requests ───────────────────────────────────
+    // One request carries many repositories; split into up to
+    // GITHUB_CONCURRENCY parallel requests (measured ~4x faster than one
+    // process per repository), each at most GITHUB_BATCH_MAX repositories.
+    let chunk_size = unique
+        .len()
+        .div_ceil(GITHUB_CONCURRENCY)
+        .clamp(1, crate::github::GITHUB_BATCH_MAX);
     let sem = Arc::new(Semaphore::new(GITHUB_CONCURRENCY));
-    let mut join_set: JoinSet<(usize, Option<crate::GithubInfo>)> = JoinSet::new();
-
-    for (idx, url) in inputs {
+    let mut join_set: JoinSet<(usize, Vec<Option<crate::GithubInfo>>)> = JoinSet::new();
+    for (chunk_index, chunk) in unique.chunks(chunk_size).enumerate() {
         let sem_clone = sem.clone();
-        let cfg_clone = cfg.clone();
-        // Call fetch_fn synchronously to produce a 'static BoxFuture that does
-        // NOT borrow fetch_fn — the future owns its captured data.
-        let fut = fetch_fn(url, cfg_clone);
+        let fut = fetch_fn(chunk.to_vec(), cfg.clone());
         join_set.spawn(async move {
             let _permit = sem_clone.acquire_owned().await.expect("semaphore closed");
-            let info = fut.await;
-            (idx, info)
+            (chunk_index * chunk_size, fut.await)
         });
     }
 
-    // ── Step 4: Collect results into an index-keyed buffer ─────────────────
-    let row_count = rows.len();
-    let mut results: Vec<Option<crate::GithubInfo>> = (0..row_count).map(|_| None).collect();
-    let (mut enriched, mut skipped) = (0usize, 0usize);
+    // ── Step 4: Collect results by unique-slug index ───────────────────────
+    let mut infos: Vec<Option<crate::GithubInfo>> = vec![None; unique.len()];
     while let Some(task_result) = join_set.join_next().await {
         match task_result {
-            Ok((idx, Some(info))) => {
-                results[idx] = Some(info);
-                enriched += 1;
+            Ok((offset, chunk_infos)) => {
+                for (i, info) in chunk_infos.into_iter().enumerate() {
+                    if let Some(target) = infos.get_mut(offset + i) {
+                        *target = info;
+                    }
+                }
             }
-            Ok((_, None)) => skipped += 1,
-            Err(e) => {
-                tracing::debug!(error = %e, "github enrichment task panicked");
-                skipped += 1;
-            }
+            Err(e) => tracing::debug!(error = %e, "github enrichment task panicked"),
         }
     }
 
     // ── Step 5: Write back in a single synchronous pass ────────────────────
-    for (i, row) in rows.iter_mut().enumerate() {
+    let (mut enriched, mut total) = (0usize, 0usize);
+    for (row, slug) in rows.iter_mut().zip(row_slugs) {
         let ScanOutcome::Ok(status) = &mut row.outcome else {
             continue;
         };
-        if let Some(info) = results[i].take() {
+        let Some(slug) = slug else { continue };
+        total += 1;
+        if let Some(info) = infos[slot[&slug]].clone() {
             status.github = Some(info);
+            enriched += 1;
         }
     }
-
-    let total = enriched + skipped;
-    tracing::info!(enriched, total, "GitHub enrichment complete");
+    tracing::info!(
+        enriched,
+        total,
+        requests = unique.len().div_ceil(chunk_size),
+        "GitHub enrichment complete"
+    );
 }
 
-/// Enrich [`ListRow`]s with GitHub Issue/PR counts using bounded concurrency.
+/// Enrich [`ListRow`]s with GitHub Issue/PR counts using batched requests.
 ///
 /// No-op when `cfg.enabled` is `false`. Per-repo errors (including non-GitHub
 /// remotes) degrade gracefully to `status.github = None`.
 ///
-/// Enrichment concurrency is capped at [`GITHUB_CONCURRENCY`] (= 4).  The
+/// Repositories are deduplicated by `owner/name` and looked up in batched
+/// GraphQL requests, at most [`GITHUB_CONCURRENCY`] (= 4) at a time.  The
 /// `remote_url` field on each row is used when present (WSL repos); otherwise
 /// the origin URL is resolved from the repo path via `git remote get-url
 /// origin`.
@@ -358,8 +397,8 @@ pub async fn enrich_with_github(rows: &mut [ListRow], cfg: &crate::config::Githu
     if !cfg.enabled {
         return;
     }
-    do_enrich(rows, cfg, &|url, config| {
-        Box::pin(async move { crate::github::fetch_counts_for_remote(&url, &config).await })
+    do_enrich(rows, cfg, &|slugs, config| {
+        Box::pin(async move { crate::github::fetch_infos_batch(&slugs, &config).await })
     })
     .await;
 }
@@ -430,155 +469,182 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn enrich_skips_err_rows() {
-        let cfg = GithubConfig {
+    fn info(issues: u64) -> GithubInfo {
+        GithubInfo {
+            open_issues: Some(issues),
+            open_prs: Some(0),
+        }
+    }
+
+    fn issues_of(row: &ListRow) -> Option<u64> {
+        match &row.outcome {
+            ScanOutcome::Ok(status) => status.github.as_ref().and_then(|g| g.open_issues),
+            ScanOutcome::Err(_) => None,
+        }
+    }
+
+    fn enabled() -> GithubConfig {
+        GithubConfig {
             enabled: true,
             ..Default::default()
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn enrich_skips_err_rows_and_non_github_remotes() {
         let called = Arc::new(AtomicUsize::new(0));
         let called_c = called.clone();
-        let mut rows = vec![make_err_row(0, "/a")];
-        do_enrich(&mut rows, &cfg, &move |_url, _cfg| {
+        let mut rows = vec![
+            make_err_row(0, "/a"),
+            make_ok_row(1, "/b", Some("https://gitlab.com/owner/repo".into())),
+        ];
+        do_enrich(&mut rows, &enabled(), &move |slugs, _cfg| {
             called_c.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { None })
+            Box::pin(async move { vec![None; slugs.len()] })
         })
         .await;
-        assert_eq!(
-            called.load(Ordering::SeqCst),
-            0,
-            "fetch must not be called for Err rows"
-        );
+        assert_eq!(called.load(Ordering::SeqCst), 0, "nothing to look up");
     }
 
     #[tokio::test]
     async fn enrich_uses_remote_url_override_when_present() {
-        let cfg = GithubConfig {
-            enabled: true,
-            enable_issues: true,
-            enable_prs: true,
-            ..Default::default()
-        };
-        let received_url = Arc::new(std::sync::Mutex::new(None::<String>));
-        let received_c = received_url.clone();
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_c = received.clone();
         let mut rows = vec![make_ok_row(
             0,
             "/nonexistent/path",
             Some("https://github.com/owner/repo".into()),
         )];
-        do_enrich(&mut rows, &cfg, &move |url, _cfg| {
-            *received_c.lock().unwrap() = Some(url.clone());
+        do_enrich(&mut rows, &enabled(), &move |slugs, _cfg| {
+            received_c.lock().unwrap().extend(slugs.clone());
             Box::pin(async move {
-                Some(GithubInfo {
+                vec![Some(GithubInfo {
                     open_issues: Some(5),
                     open_prs: Some(2),
-                })
+                })]
             })
         })
         .await;
         // The pre-populated remote_url was used (path fallback would fail for /nonexistent)
         assert_eq!(
-            received_url.lock().unwrap().as_deref(),
-            Some("https://github.com/owner/repo")
+            *received.lock().unwrap(),
+            vec![("owner".to_string(), "repo".to_string())]
         );
-        if let ScanOutcome::Ok(status) = &rows[0].outcome {
-            assert_eq!(status.github.as_ref().unwrap().open_issues, Some(5));
-            assert_eq!(status.github.as_ref().unwrap().open_prs, Some(2));
-        } else {
+        let ScanOutcome::Ok(status) = &rows[0].outcome else {
             panic!("expected Ok row");
-        }
+        };
+        assert_eq!(status.github.as_ref().unwrap().open_issues, Some(5));
+        assert_eq!(status.github.as_ref().unwrap().open_prs, Some(2));
     }
 
     #[tokio::test]
-    async fn enrich_degrades_to_none_on_per_row_error() {
-        let cfg = GithubConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        let mut rows = vec![make_ok_row(
-            0,
-            "/a",
-            Some("https://github.com/owner/repo".into()),
-        )];
-        do_enrich(&mut rows, &cfg, &|_url, _cfg| Box::pin(async { None })).await;
-        if let ScanOutcome::Ok(status) = &rows[0].outcome {
-            assert!(
-                status.github.is_none(),
-                "github must be None when fetch returns None"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn enrich_preserves_row_order() {
-        let cfg = GithubConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        let urls = [
-            "https://github.com/owner/a",
-            "https://github.com/owner/b",
-            "https://github.com/owner/c",
+    async fn enrich_degrades_to_none_per_repository() {
+        let mut rows = vec![
+            make_ok_row(0, "/a", Some("https://github.com/owner/a".into())),
+            make_ok_row(1, "/b", Some("https://github.com/owner/gone".into())),
         ];
-        let mut rows: Vec<ListRow> = urls
-            .iter()
-            .enumerate()
-            .map(|(i, url)| make_ok_row(i, &format!("/repo{}", i), Some(url.to_string())))
-            .collect();
-
-        // Return distinct GithubInfo per URL so we can verify assignment
-        do_enrich(&mut rows, &cfg, &|url, _cfg| {
-            let issue_count: u64 = if url.ends_with("/a") {
-                1
-            } else if url.ends_with("/b") {
-                2
-            } else {
-                3
-            };
+        do_enrich(&mut rows, &enabled(), &|slugs, _cfg| {
             Box::pin(async move {
-                Some(GithubInfo {
-                    open_issues: Some(issue_count),
-                    open_prs: Some(0),
-                })
+                slugs
+                    .iter()
+                    .map(|(_, name)| (name != "gone").then(|| info(1)))
+                    .collect()
             })
         })
         .await;
-
-        for (i, row) in rows.iter().enumerate() {
-            if let ScanOutcome::Ok(status) = &row.outcome {
-                let expected = (i + 1) as u64;
-                assert_eq!(
-                    status.github.as_ref().unwrap().open_issues,
-                    Some(expected),
-                    "row {i} should have open_issues={expected}"
-                );
-            }
-        }
+        assert_eq!(issues_of(&rows[0]), Some(1));
+        assert_eq!(issues_of(&rows[1]), None);
     }
 
     #[tokio::test]
-    async fn enrich_bounded_concurrency_holds_at_4() {
-        let cfg = GithubConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        // 10 rows all with remote URLs
+    async fn enrich_short_batch_result_leaves_rest_none() {
+        let mut rows = vec![
+            make_ok_row(0, "/a", Some("https://github.com/owner/a".into())),
+            make_ok_row(1, "/b", Some("https://github.com/owner/b".into())),
+        ];
+        do_enrich(&mut rows, &enabled(), &|_slugs, _cfg| {
+            Box::pin(async { vec![] })
+        })
+        .await;
+        assert_eq!(issues_of(&rows[0]), None);
+        assert_eq!(issues_of(&rows[1]), None);
+    }
+
+    #[tokio::test]
+    async fn enrich_preserves_row_order_across_chunks() {
+        // 10 distinct repositories → 4 chunks (3/3/3/1); each repo's issue
+        // count encodes its number so misassignment is detectable.
         let mut rows: Vec<ListRow> = (0..10)
             .map(|i| {
                 make_ok_row(
                     i,
-                    &format!("/repo{}", i),
-                    Some(format!("https://github.com/owner/repo{}", i)),
+                    &format!("/repo{i}"),
+                    Some(format!("https://github.com/owner/repo{i}")),
+                )
+            })
+            .collect();
+        let chunks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let chunks_c = chunks.clone();
+        do_enrich(&mut rows, &enabled(), &move |slugs, _cfg| {
+            chunks_c.lock().unwrap().push(slugs.len());
+            Box::pin(async move {
+                slugs
+                    .iter()
+                    .map(|(_, name)| Some(info(name.trim_start_matches("repo").parse().unwrap())))
+                    .collect()
+            })
+        })
+        .await;
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(issues_of(row), Some(i as u64), "row {i}");
+        }
+        let mut sizes = chunks.lock().unwrap().clone();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![1, 3, 3, 3]);
+    }
+
+    #[tokio::test]
+    async fn enrich_looks_up_a_shared_remote_once() {
+        // A linked worktree shares its main repository's remote.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        let mut rows = vec![
+            make_ok_row(0, "/app", Some("git@github.com:owner/app.git".into())),
+            make_ok_row(1, "/app-wt", Some("https://github.com/owner/app".into())),
+        ];
+        do_enrich(&mut rows, &enabled(), &move |slugs, _cfg| {
+            seen_c.lock().unwrap().extend(slugs.clone());
+            Box::pin(async move { vec![Some(info(7)); slugs.len()] })
+        })
+        .await;
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(issues_of(&rows[0]), Some(7));
+        assert_eq!(issues_of(&rows[1]), Some(7));
+    }
+
+    #[tokio::test]
+    async fn enrich_bounded_concurrency_holds_at_4() {
+        // More repositories than GITHUB_CONCURRENCY × GITHUB_BATCH_MAX so
+        // there are more chunks than permits.
+        let count = GITHUB_CONCURRENCY * crate::github::GITHUB_BATCH_MAX + 7;
+        let mut rows: Vec<ListRow> = (0..count)
+            .map(|i| {
+                make_ok_row(
+                    i,
+                    &format!("/repo{i}"),
+                    Some(format!("https://github.com/owner/repo{i}")),
                 )
             })
             .collect();
 
         let current = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
-        let current_c = current.clone();
-        let peak_c = peak.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (current_c, peak_c, calls_c) = (current.clone(), peak.clone(), calls.clone());
 
-        do_enrich(&mut rows, &cfg, &move |_url, _cfg| {
+        do_enrich(&mut rows, &enabled(), &move |slugs, _cfg| {
+            assert!(slugs.len() <= crate::github::GITHUB_BATCH_MAX);
+            calls_c.fetch_add(1, Ordering::SeqCst);
             let cur = current_c.clone();
             let pk = peak_c.clone();
             Box::pin(async move {
@@ -586,7 +652,7 @@ mod tests {
                 pk.fetch_max(n, Ordering::SeqCst);
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 cur.fetch_sub(1, Ordering::SeqCst);
-                None
+                vec![None; slugs.len()]
             })
         })
         .await;
@@ -597,6 +663,7 @@ mod tests {
             "peak concurrency {observed} exceeded cap {GITHUB_CONCURRENCY}"
         );
         assert!(observed > 0, "no concurrent executions observed");
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
     }
 
     // ── find_current_repo / build_targets tests (preserved) ─────────────
@@ -670,12 +737,14 @@ mod tests {
         let config = crate::AppConfig {
             repositories: vec![
                 crate::config::RepoEntry {
+                    worktree_of: None,
                     name: Some("a".into()),
                     path: PathBuf::from("/tmp/a"),
                     fetch: None,
                     distro: None,
                 },
                 crate::config::RepoEntry {
+                    worktree_of: None,
                     name: Some("b".into()),
                     path: PathBuf::from("/tmp/b"),
                     fetch: None,
@@ -696,6 +765,7 @@ mod tests {
     fn build_targets_propagates_distro() {
         let config = crate::AppConfig {
             repositories: vec![crate::config::RepoEntry {
+                worktree_of: None,
                 name: Some("wsl-repo".into()),
                 path: PathBuf::from("/home/user/proj"),
                 fetch: None,

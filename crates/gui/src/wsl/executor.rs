@@ -298,6 +298,105 @@ impl<R: WslCommandRunner> WslExecutor<R> {
     }
 }
 
+impl<R: WslCommandRunner> WslExecutor<R> {
+    fn base_args(&self, distro: Option<&str>) -> Vec<String> {
+        let mut args = Vec::with_capacity(16);
+        if let Some(d) = distro {
+            args.push("-d".into());
+            args.push(d.into());
+        }
+        args.push("--exec".into());
+        args.push(self.helper_path.clone());
+        args
+    }
+
+    async fn run_json<T: serde::de::DeserializeOwned>(
+        &self,
+        args: &[String],
+    ) -> Result<T, WslError> {
+        let out = self.runner.run(args).await?;
+        if out.status != Some(0) {
+            return Err(WslError::NonZeroExit {
+                status: out.status,
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        serde_json::from_slice(&out.stdout).map_err(WslError::ParseJson)
+    }
+
+    /// Repositories and linked worktrees under a WSL scan root (`--discover`).
+    pub async fn discover(
+        &self,
+        distro: Option<&str>,
+        root: &Path,
+        depth: u32,
+        exclude: &[String],
+        worktrees: bool,
+    ) -> Result<Vec<git_clawler_core::discovery::Found>, WslError> {
+        let mut args = self.base_args(distro);
+        args.push("--discover".into());
+        args.push(root.to_string_lossy().into_owned());
+        args.push("--depth".into());
+        args.push(depth.to_string());
+        for item in exclude {
+            args.push("--exclude".into());
+            args.push(item.clone());
+        }
+        if !worktrees {
+            args.push("--no-worktrees".into());
+        }
+        let resp: git_clawler_wsl_helper::protocol::DiscoverResponse = self.run_json(&args).await?;
+        if resp.protocol_version != git_clawler_wsl_helper::PROTOCOL_VERSION {
+            return Err(WslError::ProtocolMismatch {
+                got: resp.protocol_version,
+                expected: git_clawler_wsl_helper::PROTOCOL_VERSION,
+            });
+        }
+        match resp.status {
+            git_clawler_wsl_helper::protocol::DiscoverStatus::Ok(found) => Ok(found
+                .into_iter()
+                .map(|f| git_clawler_core::discovery::Found {
+                    path: PathBuf::from(f.path),
+                    worktree_of: f.worktree_of.map(PathBuf::from),
+                })
+                .collect()),
+            git_clawler_wsl_helper::protocol::DiscoverStatus::Err(err) => {
+                Err(WslError::HelperReportedError {
+                    message: helper_error_message(&err),
+                })
+            }
+        }
+    }
+
+    /// Which of the `(worktree, main repository)` pairs Git no longer tracks.
+    pub async fn worktrees_gone(
+        &self,
+        distro: Option<&str>,
+        pairs: &[(PathBuf, PathBuf)],
+    ) -> Result<Vec<PathBuf>, WslError> {
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args = self.base_args(distro);
+        args.push("--worktree-gone".into());
+        for (path, parent) in pairs {
+            args.push("--worktree".into());
+            args.push(path.to_string_lossy().into_owned());
+            args.push("--parent".into());
+            args.push(parent.to_string_lossy().into_owned());
+        }
+        let resp: git_clawler_wsl_helper::protocol::WorktreeGoneResponse =
+            self.run_json(&args).await?;
+        if resp.protocol_version != git_clawler_wsl_helper::PROTOCOL_VERSION {
+            return Err(WslError::ProtocolMismatch {
+                got: resp.protocol_version,
+                expected: git_clawler_wsl_helper::PROTOCOL_VERSION,
+            });
+        }
+        Ok(resp.gone.into_iter().map(PathBuf::from).collect())
+    }
+}
+
 fn repo_status_from_dto(d: RepoStatusDto) -> RepoStatus {
     RepoStatus {
         current_branch: d.current_branch,
@@ -313,6 +412,7 @@ fn repo_status_from_dto(d: RepoStatusDto) -> RepoStatus {
         conflict_predicted: d.conflict_predicted,
         fetch_warning: d.fetch_warning,
         recent_commits: d.recent_commits.into_iter().map(recent_from_dto).collect(),
+        worktree_parent: d.worktree_parent.map(PathBuf::from),
     }
 }
 
@@ -434,6 +534,7 @@ mod tests {
 
     fn ok_status() -> PathStatus {
         PathStatus::Ok(RepoStatusDto {
+            worktree_parent: None,
             current_branch: Some("main".into()),
             uncommitted_files: 0,
             unpushed_branches: vec![],
@@ -558,6 +659,115 @@ mod tests {
         assert_eq!(args[9], "target");
         assert_eq!(args[10], "--exclude");
         assert_eq!(args[11], "node_modules");
+    }
+
+    #[tokio::test]
+    async fn discover_builds_args_and_decodes_worktrees() {
+        let stdout = serde_json::to_vec(&git_clawler_wsl_helper::protocol::DiscoverResponse {
+            protocol_version: git_clawler_wsl_helper::PROTOCOL_VERSION,
+            helper_version: "0.0.1".into(),
+            scanned_at: "2026-11-16T00:00:00Z".into(),
+            root: "/home/u/p".into(),
+            status: git_clawler_wsl_helper::protocol::DiscoverStatus::Ok(vec![
+                git_clawler_wsl_helper::protocol::FoundDto {
+                    path: "/home/u/p/app".into(),
+                    worktree_of: None,
+                },
+                git_clawler_wsl_helper::protocol::FoundDto {
+                    path: "/tmp/app-wt".into(),
+                    worktree_of: Some("/home/u/p/app".into()),
+                },
+            ]),
+        })
+        .unwrap();
+        let (runner, captured) = MockRunner::new(move || {
+            Ok(RunOutput {
+                status: Some(0),
+                stdout: stdout.clone(),
+                stderr: vec![],
+            })
+        });
+        let executor = WslExecutor::new(runner, "/usr/bin/helper".into());
+        let found = executor
+            .discover(
+                Some("Ubuntu"),
+                Path::new("/home/u/p"),
+                1,
+                &["old".into()],
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[1].worktree_of, Some(PathBuf::from("/home/u/p/app")));
+        let args = captured.lock().unwrap();
+        assert_eq!(
+            &args[..],
+            [
+                "-d",
+                "Ubuntu",
+                "--exec",
+                "/usr/bin/helper",
+                "--discover",
+                "/home/u/p",
+                "--depth",
+                "1",
+                "--exclude",
+                "old",
+                "--no-worktrees"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn worktrees_gone_pairs_paths_with_parents() {
+        let stdout = serde_json::to_vec(&git_clawler_wsl_helper::protocol::WorktreeGoneResponse {
+            protocol_version: git_clawler_wsl_helper::PROTOCOL_VERSION,
+            helper_version: "0.0.1".into(),
+            gone: vec!["/tmp/wt".into()],
+        })
+        .unwrap();
+        let (runner, captured) = MockRunner::new(move || {
+            Ok(RunOutput {
+                status: Some(0),
+                stdout: stdout.clone(),
+                stderr: vec![],
+            })
+        });
+        let executor = WslExecutor::new(runner, "/usr/bin/helper".into());
+        let gone = executor
+            .worktrees_gone(
+                None,
+                &[(PathBuf::from("/tmp/wt"), PathBuf::from("/home/u/app"))],
+            )
+            .await
+            .unwrap();
+        assert_eq!(gone, vec![PathBuf::from("/tmp/wt")]);
+        let args = captured.lock().unwrap();
+        assert_eq!(
+            &args[..],
+            [
+                "--exec",
+                "/usr/bin/helper",
+                "--worktree-gone",
+                "--worktree",
+                "/tmp/wt",
+                "--parent",
+                "/home/u/app"
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_parent_maps_from_helper_dto() {
+        let dto: RepoStatusDto = serde_json::from_str(
+            r#"{"current_branch":"f","uncommitted_files":0,"unpushed_branches":[],"ahead":0,"behind":0,"worktree_parent":"/home/u/app"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            repo_status_from_dto(dto).worktree_parent,
+            Some(PathBuf::from("/home/u/app"))
+        );
     }
 
     #[tokio::test]
@@ -934,6 +1144,7 @@ mod tests {
     #[test]
     fn g3_repo_status_from_dto_preserves_conflict_predicted() {
         let dto = RepoStatusDto {
+            worktree_parent: None,
             current_branch: Some("main".into()),
             uncommitted_files: 0,
             unpushed_branches: vec![],
@@ -953,6 +1164,7 @@ mod tests {
             .contains("cached remote refs"));
 
         let dto_none = RepoStatusDto {
+            worktree_parent: None,
             current_branch: None,
             uncommitted_files: 0,
             unpushed_branches: vec![],

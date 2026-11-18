@@ -131,10 +131,7 @@ fn build_notify_watcher(
     let config_path_for_cb = config_path.cloned();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| match res {
         Ok(event) => {
-            if matches!(
-                event.kind,
-                EventKind::Modify(notify::event::ModifyKind::Metadata(_))
-            ) {
+            if is_read_only_noise(&event) {
                 return;
             }
             for path in event.paths {
@@ -211,6 +208,24 @@ enum RawSignal {
     Path(PathBuf),
     Config,
     Error(String),
+}
+
+/// Returns `true` for events that reading a repository produces without
+/// changing it, so scans do not trigger themselves.
+///
+/// - `Access`: inotify reports opening and closing files and directories.
+/// - `Modify(Metadata)`: timestamp and permission updates.
+/// - `Modify(Any)` on a directory: Windows reports a directory whose
+///   last-access time changed when it is listed. Real changes inside the
+///   directory also arrive as events for the affected files.
+fn is_read_only_noise(event: &Event) -> bool {
+    match event.kind {
+        EventKind::Access(_) | EventKind::Modify(notify::event::ModifyKind::Metadata(_)) => true,
+        EventKind::Modify(notify::event::ModifyKind::Any) => {
+            !event.paths.is_empty() && event.paths.iter().all(|p| p.is_dir())
+        }
+        _ => false,
+    }
 }
 
 /// Returns `true` if the path should be ignored (build/git plumbing noise).
@@ -401,6 +416,77 @@ mod tests {
         .await
         .unwrap_or(false);
         assert!(got, "expected RepoChanged event");
+    }
+
+    #[test]
+    fn read_only_noise_ignores_access_metadata_and_directory_modify() {
+        use notify::event::{AccessKind, CreateKind, MetadataKind, ModifyKind};
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("HEAD");
+        std::fs::write(&file, "x").unwrap();
+        let event = |kind, path: &Path| Event::new(kind).add_path(path.to_path_buf());
+
+        assert!(is_read_only_noise(&event(
+            EventKind::Access(AccessKind::Any),
+            &file
+        )));
+        assert!(is_read_only_noise(&event(
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            &file
+        )));
+        assert!(is_read_only_noise(&event(
+            EventKind::Modify(ModifyKind::Any),
+            dir.path()
+        )));
+
+        assert!(!is_read_only_noise(&event(
+            EventKind::Modify(ModifyKind::Any),
+            &file
+        )));
+        assert!(!is_read_only_noise(&event(
+            EventKind::Create(CreateKind::Any),
+            dir.path()
+        )));
+        // A directory that no longer exists is a real change (e.g. removed worktree).
+        assert!(!is_read_only_noise(&event(
+            EventKind::Modify(ModifyKind::Any),
+            &dir.path().join("gone")
+        )));
+    }
+
+    #[tokio::test]
+    async fn reading_a_repository_does_not_signal_change() {
+        let dir = tempdir().expect("tempdir");
+        let repo_path = dir.path().to_path_buf();
+        std::fs::create_dir_all(repo_path.join(".git/refs")).unwrap();
+        std::fs::write(repo_path.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(repo_path.join("README.md"), "x").unwrap();
+
+        let cfg = WatcherConfig {
+            repos: vec![repo_path.clone()],
+            config_path: None,
+            poll_interval: Duration::from_secs(60),
+            debounce: Duration::from_millis(200),
+        };
+        let (_w, mut rx) = Watcher::start(cfg).expect("start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // What a status scan does: open directories and read files.
+        let _ = std::fs::read_dir(&repo_path).unwrap().count();
+        let _ = std::fs::read_dir(repo_path.join(".git")).unwrap().count();
+        let _ = std::fs::read(repo_path.join(".git/HEAD")).unwrap();
+        let _ = std::fs::read(repo_path.join("README.md")).unwrap();
+
+        let got = timeout(Duration::from_millis(600), async {
+            while let Some(ev) = rx.recv().await {
+                if matches!(ev, WatchEvent::RepoChanged { .. }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(!got, "read-only access must not signal a change");
     }
 
     #[tokio::test]

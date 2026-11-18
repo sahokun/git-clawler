@@ -8,6 +8,7 @@
 //! - [`status`] — Synchronous git repository status scanning
 
 pub mod config;
+pub mod discovery;
 pub mod fetch_worker;
 pub mod github;
 pub mod list;

@@ -65,5 +65,27 @@ jobs:
           npm --version
       - working-directory: crates/gui
         run: npm ci
-      - working-directory: crates/gui
-        run: npm audit
+      - name: Test npm audit exception handling
+        run: python3 scripts/test-audit-npm.py
+      - name: Run npm audit with reviewed exceptions
+        run: python3 scripts/audit-npm.py
+
+  dependency-policy:
+    name: dependency policy
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Fetch base revision
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git fetch --depth=1 origin "$BASE_SHA"
+      - name: Test dependency policy checker
+        run: python3 scripts/test-refresh-deps.py
+      - name: Check publication age and Tauri alignment
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python3 scripts/refresh-deps.py check --base "$BASE_SHA" --markdown "$RUNNER_TEMP/deps.md"
+      - name: Publish evidence
+        if: always()
+        run: cat "$RUNNER_TEMP/deps.md" >> "$GITHUB_STEP_SUMMARY" || true
