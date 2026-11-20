@@ -1,12 +1,16 @@
 version: 2
-# Routine version updates arrive once a month as one grouped PR per ecosystem.
+# Routine version updates arrive once a month. Each ecosystem gets one grouped PR for
+# minor/patch updates and a separate grouped PR for major updates, so compatible updates
+# can merge without waiting for the review that majors need.
 # They are reminders: re-check the seven-day rule for transitive dependencies,
 # regenerate notices and keep Tauri Rust/JS versions aligned before merging.
-# Security updates are configured in repository settings and are not grouped.
+# The cooldown skips releases younger than seven days, matching the dependency policy.
+# Security updates are configured in repository settings, are not grouped and ignore
+# the cooldown and the open pull request limit.
 updates:
   - package-ecosystem: cargo
     directory: /
-    open-pull-requests-limit: 1
+    open-pull-requests-limit: 2
     schedule:
       interval: monthly
     cooldown:
@@ -15,9 +19,14 @@ updates:
       cargo-monthly:
         applies-to: version-updates
         patterns: ["*"]
+        update-types: [minor, patch]
+      cargo-major:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [major]
   - package-ecosystem: npm
     directory: /crates/gui
-    open-pull-requests-limit: 1
+    open-pull-requests-limit: 2
     schedule:
       interval: monthly
     cooldown:
@@ -26,12 +35,24 @@ updates:
       npm-monthly:
         applies-to: version-updates
         patterns: ["*"]
+        update-types: [minor, patch]
+      npm-major:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [major]
   - package-ecosystem: github-actions
     directory: /
-    open-pull-requests-limit: 1
+    open-pull-requests-limit: 2
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
     groups:
       actions-monthly:
         applies-to: version-updates
         patterns: ["*"]
+        update-types: [minor, patch]
+      actions-major:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [major]
