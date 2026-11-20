@@ -54,9 +54,16 @@ must identify a reason, affected targets, tracking issue and expiry; do not sile
 on versions younger than seven days, yanked/deprecated releases or Tauri Rust/JavaScript
 major.minor mismatches; `--markdown FILE` writes the publication table for the PR.
 `python3 scripts/refresh-deps.py fix` also pins too-new crates to the newest eligible
-release, regenerates `THIRD_PARTY_NOTICES.txt` and adds licence supplements for new crate
-versions from the previous supplement's sources. Review its notes; npm versions and
-Tauri mismatches are reported, not changed.
+release and adds licence supplements for new crate versions from the previous
+supplement's sources. Review its notes; npm versions and Tauri mismatches are reported,
+not changed.
+
+`THIRD_PARTY_NOTICES.txt` is not committed. The release workflow generates it from the
+lockfiles with `python3 scripts/refresh-deps.py notices` and ships it with every release
+asset. The dependency policy check runs the same command on pull requests and fails when
+a shipped package has no licence text; add the supplement with `fix` (or by hand in
+`licenses/`). Generate it locally (after `npm ci` in `crates/gui`) before running
+`scripts/package-windows-portable.ps1`.
 
 Public documentation is canonical English; update the Japanese mirrors for substantial
 changes. Document CLI/TOML compatibility changes. Never include credentials, personal

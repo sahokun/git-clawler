@@ -12,7 +12,8 @@ Windows 専用変更は Windows でも検証します。helper の配置・GUI �
 Conventional Commits で変更目的を分け、挙動変更には回帰テストを付けます。
 新規依存は公式レジストリで実在・保守・ライセンス・advisory を確認し、推移的依存を含め公開7日以上の版のみ採用します。
 例外は理由・対象・Issue・期限を明記し、期限を黙って延長しません。Git・設定処理は core に置きます。
-依存更新では `python3 scripts/refresh-deps.py check`（公開7日・yanked/deprecated・Tauri の Rust/JS 版ずれを検査、`--markdown FILE` で PR 用の表を出力）を実行します。`fix` は新しすぎる crate の固定、通知ファイル再生成、ライセンス補足の追加まで行います。
+依存更新では `python3 scripts/refresh-deps.py check`（公開7日・yanked/deprecated・Tauri の Rust/JS 版ずれを検査、`--markdown FILE` で PR 用の表を出力）を実行します。`fix` は新しすぎる crate の固定とライセンス補足の追加まで行います。
+`THIRD_PARTY_NOTICES.txt` はコミットせず、リリースのワークフローが `python3 scripts/refresh-deps.py notices` で lockfile から生成して配布物に同梱します。PR の dependency policy チェックも同じコマンドを実行し、配布する依存にライセンス文が無ければ失敗します。その場合は `fix`（または `licenses/` への手作業の追加）で補足を足します。ローカルでポータブル版を作るときは、`crates/gui` で `npm ci` を実行してから生成します。
 公開文書は英語を正本とし、大きな変更は日本語版にも反映します。機密情報や個人設定を含めないでください。
 
 ## Node.jsの修正基準
