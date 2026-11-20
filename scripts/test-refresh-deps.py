@@ -149,5 +149,22 @@ class SupplementTests(unittest.TestCase):
         self.assertIsNone(rd.match_renamed("COPYING", names))
 
 
+class LicenceGapTests(unittest.TestCase):
+    PACKAGES = json.loads(npm_lock(
+        react="19.0.0",
+        **{"@rolldown__binding-win32-x64-msvc": {"version": "1.0.0", "optional": True, "os": ["win32"]}},
+    ))["packages"]
+
+    def test_platform_optional_npm_packages_are_not_gaps(self):
+        self.assertEqual(rd.licence_gaps(["npm: node_modules/@rolldown/binding-win32-x64-msvc"], self.PACKAGES), [])
+
+    def test_rust_crate_without_text_is_a_gap(self):
+        self.assertEqual(rd.licence_gaps(["Rust: objc2"], self.PACKAGES), ["licence text still missing: Rust: objc2"])
+
+    def test_shipped_npm_package_without_text_is_a_gap(self):
+        gaps = rd.licence_gaps(["npm: node_modules/react"], self.PACKAGES)
+        self.assertEqual(gaps, ["licence text missing (check node_modules is installed): npm: node_modules/react"])
+
+
 if __name__ == "__main__":
     unittest.main()

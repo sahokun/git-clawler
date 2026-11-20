@@ -3,6 +3,7 @@
 Usage:
   python3 scripts/refresh-deps.py check [--base REF] [--markdown FILE]
   python3 scripts/refresh-deps.py fix   [--base REF] [--markdown FILE]
+  python3 scripts/refresh-deps.py notices
 
 `check` compares Cargo.lock and crates/gui/package-lock.json with the base
 revision (default: origin/main) and fails when an added or updated registry
@@ -13,6 +14,9 @@ crates and JavaScript packages disagree on major.minor. It changes nothing.
 that satisfies the rule, regenerates THIRD_PARTY_NOTICES.txt, adds licence
 supplements for crates whose texts are missing (reusing the previous version's
 supplement sources at the new upstream commit), and then runs `check`.
+
+`notices` generates THIRD_PARTY_NOTICES.txt (not committed; CI and the release
+workflow generate it) and fails when a shipped package has no licence text.
 
 Standard library only. Network access: crates.io, registry.npmjs.org,
 raw.githubusercontent.com and api.github.com (unauthenticated).
@@ -399,25 +403,49 @@ def command_fix(args) -> int:
         for name in rust_missing:
             notes.append(add_supplement(name, versions[name]))
         missing = generate_notices()
-    packages = json.loads(read(NPM_LOCK) or "{}").get("packages", {})
-    for item in missing:
-        if item.startswith("Rust: "):
-            notes.append(f"licence text still missing: {item}")
-        elif item.startswith("npm: "):
-            if not is_platform_optional(packages, item.removeprefix("npm: ")):
-                notes.append(f"licence text missing (check node_modules is installed): {item}")
+    notes += licence_gaps(missing, json.loads(read(NPM_LOCK) or "{}").get("packages", {}))
     for note in notes:
         print("-", note)
     return command_check(args)
 
 
+def licence_gaps(missing: list[str], packages: dict[str, dict]) -> list[str]:
+    """Licence texts that must be added before the notices are complete.
+
+    Platform-optional npm packages are skipped: they are build tools for other
+    platforms, are absent from a Linux install and are not shipped."""
+    gaps = []
+    for item in missing:
+        if item.startswith("Rust: "):
+            gaps.append(f"licence text still missing: {item}")
+        elif item.startswith("npm: ") and not is_platform_optional(packages, item.removeprefix("npm: ")):
+            gaps.append(f"licence text missing (check node_modules is installed): {item}")
+    return gaps
+
+
+def command_notices() -> int:
+    """Generate THIRD_PARTY_NOTICES.txt and fail when a shipped licence text is missing."""
+    run("cargo", "fetch", "--locked", capture=False)
+    gaps = licence_gaps(generate_notices(), json.loads(read(NPM_LOCK) or "{}").get("packages", {}))
+    for gap in gaps:
+        print("-", gap)
+    if gaps:
+        print("PROBLEM: run `python3 scripts/refresh-deps.py fix` to add licence supplements, "
+              "or add licenses/<name>-<version>.txt by hand", file=sys.stderr)
+        return 1
+    print("THIRD_PARTY_NOTICES.txt generated; every licence text is present")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=("check", "fix"))
+    parser.add_argument("command", choices=("check", "fix", "notices"))
     parser.add_argument("--base", default="origin/main", help="git revision to compare with")
     parser.add_argument("--markdown", help="write the evidence table to this file")
     parser.add_argument("--now", type=lambda s: parse_time(s), default=dt.datetime.now(dt.timezone.utc), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.command == "notices":
+        return command_notices()
     if run("git", "rev-parse", "--verify", "--quiet", args.base + "^{commit}", check=False).returncode:
         parser.error(f"unknown base revision {args.base!r}; fetch it first")
     return command_check(args) if args.command == "check" else command_fix(args)
