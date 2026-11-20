@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # Monthly dependency update
 
-Run when a grouped Dependabot PR (`*-monthly`) arrives, or with no PR to refresh manually.
+Run when a grouped Dependabot PR (`*-monthly` for minor/patch, `*-major` for majors) arrives, or with no PR to refresh manually.
 Argument: optional PR number(s). Scripts do the mechanical work; do not repeat it by hand.
 
 ## Token rules
