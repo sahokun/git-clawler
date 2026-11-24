@@ -34,6 +34,14 @@ ignore = [
   # Tracking: https://github.com/sahokun/git-clawler/issues/61 (migrate to jiff)
   # Review expires 2027-02-18.
   "RUSTSEC-2026-0543", # chrono unmaintained
+  # EXCEPTION: the fixed releases are younger than the seven-day rule.
+  # url: our crates never call `Url::origin()`; Tauri only passes the app's own
+  # webview URLs. cookie: the nonce reuse needs fork(), and cookie is reached
+  # only through Tauri, which runs on Windows only.
+  # Tracking: https://github.com/sahokun/git-clawler/issues/14
+  # Review expires 2026-12-07. Update to url 2.5.9 and cookie 0.18.3 instead.
+  "RUSTSEC-2026-0592", # url Url::origin stack overflow (fixed in 2.5.9)
+  "RUSTSEC-2026-0594", # cookie private nonce reuse after fork (fixed in 0.18.3)
 ]
 
 [licenses]

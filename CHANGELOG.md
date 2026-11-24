@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Record RUSTSEC-2026-0592 (url) and RUSTSEC-2026-0594 (cookie) as reviewed advisory exceptions until 2026-12-07, when the fixed releases have passed the seven-day rule.
+
 ## 1.1.0
 
 - Run npm audit through `scripts/audit-npm.py` with reviewed, expiring exceptions in `npm-audit.toml`; only advisories reachable solely through devDependencies can be waived. GHSA-fc5q-39xc-vjpf (picomatch, via vite/vitest) is waived until a fixed release is available.
