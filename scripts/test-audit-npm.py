@@ -78,7 +78,7 @@ class Evaluate(unittest.TestCase):
 
 class Config(unittest.TestCase):
     def test_repository_exceptions_are_complete(self):
-        exceptions = tomllib.loads((ROOT / "npm-audit.toml").read_text())["exception"]
+        exceptions = tomllib.loads((ROOT / "npm-audit.toml").read_text()).get("exception", [])
         for e in exceptions:
             self.assertRegex(e["id"], r"^GHSA-")
             self.assertTrue(e["package"] and e["reason"].strip() and e["tracking"].startswith("https://"))

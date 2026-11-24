@@ -4,14 +4,3 @@
 # devDependencies (`npm audit --omit=dev` must not report it) and the review
 # date has not passed. Any advisory reachable from production dependencies
 # fails the audit regardless of this file.
-
-[[exception]]
-id = "GHSA-fc5q-39xc-vjpf"
-package = "picomatch"
-reason = """
-ReDoS through attacker-supplied extglob patterns; no fixed release exists.
-picomatch is reached only through vite, tinyglobby/fdir and vitest at build
-and test time, is not part of the shipped bundle, and only receives glob
-patterns from this repository's own configuration."""
-tracking = "https://github.com/sahokun/git-clawler/issues/64"
-expires = 2026-12-18
