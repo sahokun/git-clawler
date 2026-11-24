@@ -16,6 +16,9 @@ updates:
     cooldown:
       default-days: 7
     groups:
+      cargo-security:
+        applies-to: security-updates
+        patterns: ["*"]
       cargo-monthly:
         applies-to: version-updates
         patterns: ["*"]
@@ -32,6 +35,9 @@ updates:
     cooldown:
       default-days: 7
     groups:
+      npm-security:
+        applies-to: security-updates
+        patterns: ["*"]
       npm-monthly:
         applies-to: version-updates
         patterns: ["*"]
@@ -48,6 +54,9 @@ updates:
     cooldown:
       default-days: 7
     groups:
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
       actions-monthly:
         applies-to: version-updates
         patterns: ["*"]
