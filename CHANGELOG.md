@@ -4,6 +4,8 @@
 
 - Record RUSTSEC-2026-0592 (url) and RUSTSEC-2026-0594 (cookie) as reviewed advisory exceptions until 2026-12-07, when the fixed releases have passed the seven-day rule.
 
+- Update the frontend npm dependencies (Radix UI dialog/label/tabs, lucide-react, tailwind-merge, Tailwind CSS 4.3.5, Vite 8.3.8, @vitejs/plugin-react 6.3.0). Vite 8.3.8 no longer pulls in the vulnerable picomatch, so the GHSA-fc5q-39xc-vjpf exception is removed. Licence supplements are added for the Tailwind CSS WebAssembly build, which now installs on every platform.
+
 ## 1.1.0
 
 - Run npm audit through `scripts/audit-npm.py` with reviewed, expiring exceptions in `npm-audit.toml`; only advisories reachable solely through devDependencies can be waived. GHSA-fc5q-39xc-vjpf (picomatch, via vite/vitest) is waived until a fixed release is available.
